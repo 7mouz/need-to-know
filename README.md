@@ -4,7 +4,7 @@ A company brain that knows who's asking. It runs on [OpenClaw](https://openclaw.
 
 > All company data here is made up (Northwind Inc., a fictional software company).
 
-![The web page: support asks when the redesigned mobile app comes out. The answer is "not in support's documents", the page offers to pass the question to the Product team, and the right side shows what support can see and the live security results.](screenshots/web-answer.png)
+![The web page: a contractor asks for the senior engineer salary range. The answer is "not in contractor's documents", the page offers to pass the question to the People team (HR), and the right side shows what a contractor can see and the live security results.](screenshots/web-answer.png)
 
 ## The problem
 
