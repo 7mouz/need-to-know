@@ -4,6 +4,8 @@ A company brain that knows who's asking. It runs on [OpenClaw](https://openclaw.
 
 > All company data here is made up (Northwind Inc., a fictional software company).
 
+![The web page: support asks when the redesigned mobile app comes out. The answer is "not in support's documents", the page offers to pass the question to the Product team, and the right side shows what support can see and the live security results.](screenshots/web-answer.png)
+
 ## The problem
 
 Give one AI assistant all of a company's documents, and it answers everyone the same way. Real companies don't work like that. HR sees pay, engineers see the roadmap, and contractors see the basics. An AI agent that reads those files needs the same limits as a person.
@@ -31,6 +33,28 @@ company folders  ──►  roles.conf  ──►  nk setup  ──►  one sear
 - `nk` watches for probing. If one role reaches for other teams' information 3 times in 10 minutes, `nk` records an alert. The person sees a short note that such requests are reviewed. One question with hidden instructions is enough. Questions passed on through a handoff don't count. `nk alerts` shows each alert with its evidence.
 - Every action goes into an audit log that can't be quietly edited. Each entry holds a fingerprint of the entry before it, and a small anchor file remembers the count and the last fingerprint. `nk log --verify` shows if any entry was changed, deleted, added, or cut off the end. `nk log --tamper-test` proves it on copies of the log.
 - The company's values are in the brain too (`public/company-values.md`), so every role can quote them.
+
+## The web page
+
+`nk web` serves a page for the same brain. It uses Python's standard library, so there is nothing to install. Pick a role, ask a question, and see the answer with its source. If another team owns the answer, the page offers to pass the question on. The right side shows which folders the role can see and the live security results.
+
+To open it, start a tunnel from your laptop, run `nk web` on the box, and open the link it prints:
+
+```bash
+ssh -L 8765:127.0.0.1:8765 <your box>
+nk web
+```
+
+The page is locked down too:
+
+- It listens on the box only, so you reach it through the SSH tunnel.
+- Each start makes a new random token, and every request needs it.
+- It only answers requests addressed to localhost, which blocks DNS-rebinding tricks.
+- A strict content policy stops the page from loading anything from outside.
+- Answers are shown as plain text, so nothing in them can run as code.
+- It asks the AI one question at a time, so a double click doesn't spend two calls.
+- The security panel shows counts. It never shows other people's questions.
+- Everything goes through the same checks as the terminal and into the same tamper-evident log.
 
 ## Who sees what (the demo company)
 
@@ -118,6 +142,7 @@ We found 5 default settings that are wrong for an assistant shared by many roles
 | `nk hydra-audit` | Try every stored document as every role and as a stranger; flag anything the wrong people can open |
 | `nk hydra-ask <role> "question"` | Answer from what HydraDB returns for that role |
 | `nk hydra-reset --yes` | Delete the HydraDB database |
+| `nk web [port]` | The web page, on the box only (open it through an SSH tunnel) |
 
 ## Quick start
 

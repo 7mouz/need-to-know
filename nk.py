@@ -29,6 +29,8 @@ Commands:
   nk.py handoffs                Show questions people chose to pass on to another team (a person there decides)
   nk.py alerts                  Show probing alerts: a role repeatedly reaching for other teams' information
   nk.py reset --yes             Empty every agent's shelf (source files are untouched)
+  nk.py web [port]              A web page for the same brain (default port 8765), on this machine only: reach it
+                                through an SSH tunnel. Same checks and same log as the terminal
 
 HydraDB (optional storage; needs the hydradb-sdk and a key in .secrets/hydradb.key):
   nk.py hydra-push              Copy every screened document to HydraDB: one collection per folder, and an ACL
@@ -44,6 +46,7 @@ HydraDB (optional storage; needs the hydradb-sdk and a key in .secrets/hydradb.k
 
 'open-brain' always exists and gets every loaded document: the "before" brain for the demo.
 """
+import contextlib
 import csv
 import datetime
 import difflib
@@ -52,18 +55,24 @@ import email.errors
 import email.policy
 import fcntl
 import hashlib
+import hmac
 import html.parser
+import http.server
+import io
 import json
 import mailbox
 import os
 import pathlib
 import re
+import secrets
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
@@ -1361,6 +1370,8 @@ def show_log(n=20):
             print(f"{ts}  NOSEND  {r['role']:<9} -> {r['team']:<18} instruction-like text: {r['reason']}")
         elif ev == "hydra-audit":
             print(f"{ts}  HAUDIT stored {r['stored']} · critical {len(r['critical'])} · shadow {r['shadow']} · unreachable {r['unreachable']}")
+        elif ev in ("web-start", "web-stop"):
+            print(f"{ts}  WEB    page {'started' if ev == 'web-start' else 'stopped'} on port {r.get('port')}")
         elif ev == "probe-alert":
             print(f"{ts}  PROBE  {r['role']:<10} {r['signals']} reach(es) for other teams' information within {r['window_min']} min")
         elif ev == "audit-anchor-mismatch":
@@ -1894,6 +1905,381 @@ def hydra_reset(confirm):
     print(f"Deleted HydraDB database '{database}'. Upload again with: nk.py hydra-push")
 
 
+# ---------------------------------------------------------------- web page (nk web)
+#
+# The same brain in a browser, served by nk itself with Python's standard library (nothing to install).
+# It listens on 127.0.0.1 only, so you reach it through an SSH tunnel. Every request needs a random token
+# that changes each start, the Host header must be localhost (blocks DNS-rebinding tricks), a strict
+# Content-Security-Policy keeps the page from loading anything from outside, and answers are shown as plain
+# text, never as HTML. Asking, handoffs and probing alerts go through the same checks and the same log.
+
+WEB_PORT = 8765
+
+
+def web_status(role, roles):
+    """What the page shows for one role: its folders, and security counts (never other people's questions)."""
+    owners, shelf, counts = load_owners(), SHELVES / role / "knowledge", {}
+    for p in (shelf.rglob("*.md") if shelf.exists() else []):
+        folder = str(p.relative_to(shelf)).split("/", 1)[0].lower()
+        counts[folder] = counts.get(folder, 0) + 1
+    every = set(owners) | {f for fs in roles.values() for f in fs}
+
+    def latest(prefix):
+        files = sorted(REPORTS.glob(f"{prefix}-*.md")) if REPORTS.exists() else []
+        return files[-1].read_text(encoding="utf-8") if files else ""
+
+    def pick(text, label):
+        m = re.search(re.escape(label) + r"[^\n]*?\*\*([^*]+)\*\*", text)
+        return m.group(1).strip() if m else None
+
+    check, audit_report = latest("hydra-check"), latest("hydra-audit")
+    records = _recent_records(100000)
+    setup_rec = next((r for r in reversed(records) if r.get("event") == "setup"), None)
+    chain = None
+    if AUDIT_LOG.exists():
+        with contextlib.redirect_stdout(io.StringIO()):
+            ok, problems = verify_log(show=False)
+        chain = {"ok": ok, "entries": len(AUDIT_LOG.read_text(encoding="utf-8").splitlines())}
+    return {
+        "role": role, "docs": sum(counts.values()),
+        "allowed": [{"folder": f, "docs": counts.get(f, 0)} for f in sorted(roles[role])],
+        "hidden": [{"folder": f, "team": owners.get(f, ("owner unknown", ""))[0]} for f in sorted(every - roles[role])],
+        "hydra": {"clean": pick(check, "Nothing returned from another role's folders"),
+                  "graph": pick(check, "Knowledge graph fully on"),
+                  "stored": pick(audit_report, "Documents stored"),
+                  "exposed": pick(audit_report, "Readable by a stranger")},
+        "chain": chain,
+        "secure": setup_rec.get("secure") if setup_rec else None,
+        "quarantined": sum(1 for x in QUARANTINE.rglob("*") if x.is_file()) if QUARANTINE.exists() else 0,
+        "alerts": sum(1 for r in records if r.get("event") == "probe-alert"),
+        "handoffs": len(list(OUTBOX.rglob("*.md"))) if OUTBOX.exists() else 0,
+        "model": load_config()[0],
+    }
+
+
+def web_ask(role, question, roles):
+    """One question from the page: the same agent, the same source check, the same log and probing check."""
+    ok, raw, model, tries = run_agent(role, question, "web")
+    answer, why = guard(role, raw) if ok else (raw, None)
+    outcome = ("error" if not ok else "off-topic" if why in ("no source", "declined")
+               else "refused" if why == "not available" or says_not_available(answer) else "answered")
+    audit("ask", role=role, question=question, outcome=outcome, model=model, tries=tries, answer=answer[:300],
+          via="web", **({"ai_wrote": raw[:300], "why": why} if why else {}))
+    team = owning_team(answer, role, roles) if outcome == "refused" else None
+    shelf = SHELVES / role / "knowledge"
+    sources = sorted({f for f in DOC_REF.findall(answer) if (shelf / f).exists()})
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        check_probing(role)
+    return {"answer": answer, "outcome": outcome, "model": model, "sources": sources, "team": team,
+            "can_pass": bool(team) and not screen(question) and len(question) <= HANDOFF_MAX_CHARS,
+            "notice": "logged and reviewed" in out.getvalue()}
+
+
+def web_handoff(role, question, team, email, roles):
+    """Pass a question on from the page. Same rules as the terminal: the team must own a folder this role can't
+    read, the question is screened, replies go only to company addresses, no duplicates, at most 5 open."""
+    domain, email = load_email_domain(), email.strip().lower()
+    if not any(t == team and f not in roles[role] for f, (t, _) in load_owners().items()):
+        return {"ok": False, "message": "That team doesn't own anything outside this role's folders."}
+    if screen(question):
+        audit("handoff-refused", role=role, team=team, question=question[:200], reason=screen(question))
+        with contextlib.redirect_stdout(io.StringIO()):
+            check_probing(role)
+        return {"ok": False, "message": "This question has instructions aimed at an AI, so it can't be passed on. "
+                                        "Nothing was sent."}
+    if len(question) > HANDOFF_MAX_CHARS:
+        return {"ok": False, "message": f"That question is too long to pass on (over {HANDOFF_MAX_CHARS} characters)."}
+    if not re.fullmatch(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", email) or (domain and not email.endswith("@" + domain)):
+        return {"ok": False, "message": f"Replies go only to company addresses{f' (@{domain})' if domain else ''}. "
+                                        "Nothing was sent."}
+    mine = [h for h in map(read_handoff, OUTBOX.rglob("*.md")) if h["reply_to"] == email] if OUTBOX.exists() else []
+    norm = lambda q: " ".join(q.lower().split())
+    if any(h["team"] == team and norm(h["question"]) == norm(question) for h in mine):
+        return {"ok": False, "message": f"You already sent this question to the {team}. They'll reply to {email}."}
+    if len(mine) >= HANDOFF_MAX_OPEN:
+        return {"ok": False, "message": f"You have {len(mine)} questions waiting for replies. Nothing new was sent."}
+    path = draft_handoff(role, question, team, email)
+    return {"ok": True, "message": f"Sent to the {team}'s queue. If they decide to share, they'll reply to {email}.",
+            "file": str(path.relative_to(BASE))}
+
+
+class _NkWeb(http.server.BaseHTTPRequestHandler):
+    server_version, sys_version = "nk-web", ""
+
+    def log_message(self, fmt, *args):            # quiet: everything that matters goes into the audit log
+        pass
+
+    def _send(self, code, body, ctype="application/json"):
+        data = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
+        n = self.server.nonce
+        self.send_response(code)
+        for k, v in (("Content-Type", f"{ctype}; charset=utf-8"), ("Content-Length", str(len(data))),
+                     ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),
+                     ("X-Frame-Options", "DENY"), ("Referrer-Policy", "no-referrer"),
+                     ("Content-Security-Policy", f"default-src 'none'; script-src 'nonce-{n}'; style-src 'nonce-{n}'; "
+                      "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")):
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _allowed(self):
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
+        if host not in ("localhost", "127.0.0.1", "::1"):
+            self._send(403, {"error": "This page only answers on localhost. Use the SSH tunnel."})
+            return False
+        url = urllib.parse.urlparse(self.path)
+        token = self.headers.get("X-NK-Token") or urllib.parse.parse_qs(url.query).get("t", [""])[0]
+        if not hmac.compare_digest(token.encode(), self.server.token.encode()):
+            self._send(403, {"error": "Missing or wrong token. Use the link nk web printed."})
+            return False
+        return True
+
+    def do_GET(self):
+        if not self._allowed():
+            return
+        url = urllib.parse.urlparse(self.path)
+        _, roles = load_config()
+        if url.path == "/":
+            return self._send(200, WEB_PAGE.replace("{{NONCE}}", self.server.nonce).encode("utf-8"), "text/html")
+        if url.path == "/api/roles":
+            return self._send(200, {"roles": list(roles), "company": load_company(), "domain": load_email_domain()})
+        if url.path == "/api/status":
+            role = urllib.parse.parse_qs(url.query).get("role", [""])[0]
+            return self._send(200, web_status(role, roles)) if role in roles else self._send(400, {"error": "Unknown role."})
+        self._send(404, {"error": "Not found."})
+
+    def do_POST(self):
+        if not self._allowed():
+            return
+        size = int(self.headers.get("Content-Length") or 0)
+        if size > 4096:
+            return self._send(413, {"error": "Too long."})
+        try:
+            body = json.loads(self.rfile.read(size) or b"{}")
+        except ValueError:
+            return self._send(400, {"error": "Bad request."})
+        _, roles = load_config()
+        role, question = str(body.get("role", "")), " ".join(str(body.get("question", "")).split())
+        if role not in roles:
+            return self._send(400, {"error": "Unknown role."})
+        if not question or len(question) > 1000:
+            return self._send(400, {"error": "Ask a question (up to 1000 characters)."})
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/api/ask":
+            if not self.server.busy.acquire(blocking=False):     # one AI call at a time: double clicks don't spend more
+                return self._send(429, {"error": "Another question is being answered. Try again in a moment."})
+            try:
+                return self._send(200, web_ask(role, question, roles))
+            finally:
+                self.server.busy.release()
+        if path == "/api/handoff":
+            return self._send(200, web_handoff(role, question, str(body.get("team", "")), str(body.get("email", "")), roles))
+        self._send(404, {"error": "Not found."})
+
+
+def web(port=WEB_PORT):
+    """Serve the page on 127.0.0.1 only, until Ctrl+C."""
+    load_config()
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), _NkWeb)
+    server.token, server.nonce, server.busy = secrets.token_urlsafe(18), secrets.token_urlsafe(12), threading.Lock()
+    audit("web-start", port=port)
+    print(f"Need-to-Know web page on port {port}, reachable from this machine only.\\n"
+          f"On your laptop, open a tunnel:  ssh -L {port}:127.0.0.1:{port} <your-ssh-host>\\n"
+          f"Then open:  http://localhost:{port}/?t={server.token}\\n"
+          "The link works until you stop this with Ctrl+C. A new link is made each time.", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\\nStopped.")
+    finally:
+        server.server_close()
+        audit("web-stop", port=port)
+
+
+WEB_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Need-to-Know</title>
+<style nonce="{{NONCE}}">
+:root{--bg:#0d1117;--card:#161b22;--line:#30363d;--text:#e6edf3;--mute:#8b949e;--green:#3fb950;--amber:#d29922;--red:#f85149;--blue:#58a6ff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;padding:16px 28px;border-bottom:1px solid var(--line)}
+.brand{font-size:21px;font-weight:700}
+.brand small{display:block;font-size:13px;font-weight:400;color:var(--mute)}
+.who{color:var(--mute)}
+select,input,button{font:inherit;color:var(--text);background:#0b0f14;border:1px solid var(--line);border-radius:8px;padding:9px 12px}
+select{font-weight:600;color:var(--text)}
+button{background:var(--blue);border-color:var(--blue);color:#06101c;font-weight:700;cursor:pointer}
+button:disabled{opacity:.55;cursor:default}
+main{display:grid;grid-template-columns:1.45fr 1fr;gap:22px;padding:22px 28px;max-width:1240px;margin:0 auto}
+@media (max-width:900px){main{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin-bottom:22px}
+h2{margin:0 0 12px;font-size:12px;letter-spacing:.09em;text-transform:uppercase;color:var(--mute)}
+.ask{display:flex;gap:10px}.ask input{flex:1}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.chip{background:transparent;border:1px solid var(--line);color:var(--mute);font-weight:400;padding:5px 11px;border-radius:999px;font-size:13px}
+.chip:hover{color:var(--text);border-color:var(--mute)}
+.badge{display:inline-block;font-size:12px;font-weight:700;padding:3px 10px;border-radius:999px;margin-bottom:10px;background:#21262d;color:var(--mute)}
+.b-answered{background:#12301b;color:var(--green)}.b-refused{background:#352a0d;color:var(--amber)}
+.b-off-topic,.b-error{background:#3a1512;color:var(--red)}
+.answer{white-space:pre-wrap}
+.src{margin-top:12px;font-size:13px;color:var(--mute)}
+.src span{display:inline-block;background:#0b0f14;border:1px solid var(--line);border-radius:6px;padding:2px 8px;margin:4px 6px 0 0;color:var(--text)}
+.offer{border-color:#5a4512}
+.row{display:flex;gap:10px;margin-top:12px}.row input{flex:1}
+.note{font-size:13px;margin-top:10px;color:var(--amber)}
+.ok{color:var(--green)}.bad{color:var(--red)}.mute{color:var(--mute)}
+ul.list{list-style:none;margin:0;padding:0}
+ul.list li{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--line);font-size:14px}
+ul.list li:last-child{border-bottom:0}
+.k{color:var(--text)}.v{font-weight:600;text-align:right;white-space:nowrap}
+.priv{font-size:13px;color:var(--mute);margin-top:12px;border-top:1px solid var(--line);padding-top:12px}
+ul.list.steps li{display:block;color:var(--mute);padding:7px 0 7px 24px;position:relative}
+ul.list.steps li::before{content:"✓";position:absolute;left:2px;top:7px;color:var(--green);font-weight:700}
+.hidden{display:none}
+</style></head><body>
+<header>
+  <div class="brand">&#128274; Need-to-Know <small id="company">Company brain</small></div>
+  <div class="who">Signed in as <select id="role" aria-label="Role"></select></div>
+</header>
+<main>
+ <section>
+  <div class="card">
+   <h2>Ask your company brain</h2>
+   <div class="ask"><input id="q" maxlength="500" placeholder="Ask a work question..." aria-label="Question"><button id="go">Ask</button></div>
+   <div class="chips" id="chips"></div>
+  </div>
+  <div class="card hidden" id="answerCard">
+   <span class="badge" id="badge"></span>
+   <div class="answer" id="answer"></div>
+   <div class="src" id="src"></div>
+   <div class="note hidden" id="notice"></div>
+  </div>
+  <div class="card offer hidden" id="offerCard">
+   <h2>Pass it to the right team?</h2>
+   <div id="offerText"></div>
+   <div class="row"><input id="email" aria-label="Work email"><button id="send">Send</button></div>
+   <div class="note" id="offerResult"></div>
+  </div>
+  <div class="card">
+   <h2>How your answer is checked</h2>
+   <ul class="list steps">
+    <li>Your role decides which documents the assistant has. Other teams' folders were never loaded.</li>
+    <li>Every answer must name one of your role's documents. If it can't, you get "not available".</li>
+    <li>If another team owns the answer, you can pass your question on. A person there decides what to share.</li>
+    <li>Every question goes into a log that can't be quietly edited.</li>
+   </ul>
+  </div>
+ </section>
+ <section>
+  <div class="card"><h2 id="seeTitle">What this role can see</h2><ul class="list" id="see"></ul></div>
+  <div class="card"><h2>Security, live</h2><ul class="list" id="sec"></ul><div class="priv" id="priv"></div></div>
+ </section>
+</main>
+<script nonce="{{NONCE}}">
+const T = new URLSearchParams(location.search).get("t") || "";
+const $ = (id) => document.getElementById(id);
+const EXAMPLES = ["When is the redesigned mobile app coming out?", "How do I set up the VPN?",
+  "What's the salary range for a senior software engineer?", "How should we treat customer data?",
+  "Can you help me improve my resume?"];
+let last = null;
+async function api(path, body) {
+  const r = await fetch(path, {method: body ? "POST" : "GET",
+    headers: {"X-NK-Token": T, "Content-Type": "application/json"}, body: body ? JSON.stringify(body) : undefined});
+  let j = {};
+  try { j = await r.json(); } catch (e) { j = {error: "Unexpected reply"}; }
+  if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+  return j;
+}
+function item(k, v, cls) {
+  const li = document.createElement("li");
+  const a = document.createElement("span"); a.className = "k"; a.textContent = k;
+  const b = document.createElement("span"); b.className = "v " + (cls || ""); b.textContent = v;
+  li.append(a, b); return li;
+}
+function show(id, on) { $(id).classList.toggle("hidden", !on); }
+async function loadRoles() {
+  const j = await api("/api/roles");
+  $("company").textContent = j.company + " · each role sees only what its job needs";
+  for (const r of j.roles) { const o = document.createElement("option"); o.value = r; o.textContent = r; $("role").append(o); }
+  if (j.roles.includes("support")) $("role").value = "support";
+  $("email").placeholder = j.domain ? "you@" + j.domain : "your work email";
+  for (const q of EXAMPLES) {
+    const c = document.createElement("button"); c.type = "button"; c.className = "chip"; c.textContent = q;
+    c.addEventListener("click", () => { $("q").value = q; $("q").focus(); });
+    $("chips").append(c);
+  }
+  await loadStatus();
+}
+async function loadStatus() {
+  const role = $("role").value, s = await api("/api/status?role=" + encodeURIComponent(role));
+  $("seeTitle").textContent = "What " + role + " can see";
+  const see = $("see"); see.replaceChildren();
+  for (const f of s.allowed) see.append(item("✅ " + f.folder, f.docs + (f.docs === 1 ? " document" : " documents"), "ok"));
+  for (const h of s.hidden) see.append(item("🔒 " + h.folder, "ask the " + h.team, "mute"));
+  const sec = $("sec"), h = s.hydra || {}; sec.replaceChildren();
+  if (s.secure !== null && s.secure !== undefined) sec.append(item("Safety settings, every role", s.secure ? "all on" : "check nk setup", s.secure ? "ok" : "bad"));
+  if (h.clean) sec.append(item("HydraDB searches with nothing from other roles", h.clean, "ok"));
+  if (h.graph) sec.append(item("Knowledge-graph leak test", h.graph + " leaks", h.graph.startsWith("0/") ? "ok" : "bad"));
+  if (h.stored) sec.append(item("HydraDB audit, as every role and a stranger", h.stored + " docs, " + (h.exposed || "?") + " exposed", (h.exposed || "").startsWith("0") ? "ok" : "bad"));
+  if (s.chain) sec.append(item("Audit log (tamper-evident)", s.chain.ok ? "intact, " + s.chain.entries + " entries" : "problem: run nk log --verify", s.chain.ok ? "ok" : "bad"));
+  sec.append(item("Files quarantined (hidden instructions)", String(s.quarantined)));
+  sec.append(item("Probing alerts", String(s.alerts)));
+  sec.append(item("Questions waiting for a person", String(s.handoffs)));
+  $("priv").textContent = "Private by design: the documents stay on this box, and the AI (" + s.model + ") only sees the excerpts it needs to answer. This page answers on this machine only, through your SSH tunnel, and every action goes into the tamper-evident log.";
+}
+async function ask() {
+  const role = $("role").value, q = $("q").value.trim();
+  if (!q) return;
+  $("go").disabled = true; $("go").textContent = "Thinking...";
+  show("answerCard", true); show("offerCard", false); show("notice", false);
+  $("badge").className = "badge"; $("badge").textContent = "Asking the " + role + " assistant...";
+  $("answer").textContent = ""; $("src").replaceChildren();
+  try {
+    const a = await api("/api/ask", {role: role, question: q});
+    last = {role: role, question: q, team: a.team};
+    const label = {answered: "Answered from " + role + "'s documents", refused: "Not in " + role + "'s documents",
+                   "off-topic": "Off-topic: declined", error: "Error"};
+    $("badge").className = "badge b-" + a.outcome; $("badge").textContent = label[a.outcome] || a.outcome;
+    $("answer").textContent = a.answer;
+    if (a.sources.length) {
+      $("src").append(document.createTextNode("Source: "));
+      for (const f of a.sources) { const sp = document.createElement("span"); sp.textContent = f; $("src").append(sp); }
+    }
+    if (a.notice) { $("notice").textContent = "Requests for information outside your role are logged and reviewed."; show("notice", true); }
+    if (a.team) {
+      $("offerText").textContent = a.can_pass
+        ? "The " + a.team + " owns this topic. A person there reads your question and decides what, if anything, the " + role + " role may know. If they share, they reply to your work email. Nothing is looked up or shared automatically."
+        : "The " + a.team + " owns this topic, but this question can't be passed on as written.";
+      $("offerResult").textContent = ""; $("offerResult").className = "note";
+      $("email").disabled = !a.can_pass; $("send").disabled = !a.can_pass;
+      show("offerCard", true);
+    }
+    loadStatus();
+  } catch (e) {
+    $("badge").className = "badge b-error"; $("badge").textContent = "Error"; $("answer").textContent = e.message;
+  } finally { $("go").disabled = false; $("go").textContent = "Ask"; }
+}
+async function send() {
+  if (!last) return;
+  $("send").disabled = true;
+  try {
+    const r = await api("/api/handoff", {role: last.role, question: last.question, team: last.team, email: $("email").value});
+    $("offerResult").className = "note " + (r.ok ? "ok" : ""); $("offerResult").textContent = r.message;
+    if (r.ok) $("email").disabled = true; else $("send").disabled = false;
+    loadStatus();
+  } catch (e) { $("offerResult").textContent = e.message; $("send").disabled = false; }
+}
+$("go").addEventListener("click", ask);
+$("q").addEventListener("keydown", (e) => { if (e.key === "Enter") ask(); });
+$("send").addEventListener("click", send);
+$("role").addEventListener("change", () => { show("answerCard", false); show("offerCard", false); loadStatus(); });
+loadRoles().catch((e) => { document.body.textContent = e.message; });
+</script></body></html>
+"""
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help", "help"):
@@ -1932,6 +2318,8 @@ def main():
         show_log(int(rest[0]) if rest else 20)
     elif cmd == "reset" and len(rest) <= 1:
         reset(rest[0] if rest else "")
+    elif cmd == "web" and len(rest) <= 1 and (not rest or rest[0].isdigit()):
+        web(int(rest[0]) if rest else WEB_PORT)
     elif cmd == "hydra-push" and not rest:
         hydra_push()
     elif cmd == "hydra-search" and len(rest) >= 2:
