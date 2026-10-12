@@ -1,0 +1,10 @@
+# Never commit keys or local state
+.secrets/
+*.key
+.env*
+audit.log
+quarantine/
+workspaces/
+briefs/
+reports/
+__pycache__/
