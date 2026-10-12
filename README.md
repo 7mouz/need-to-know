@@ -1,12 +1,12 @@
 # Need-to-Know
 
-A company brain that knows who's asking. Built on [OpenClaw](https://openclaw.ai).
+A company brain that knows who's asking. It runs on [OpenClaw](https://openclaw.ai) and can store its documents in [HydraDB](https://hydradb.com).
 
-> All company data here is fictional (Northwind Inc., a made-up software company).
+> All company data here is made up (Northwind Inc., a fictional software company).
 
 ## The problem
 
-A shared AI assistant pointed at all of a company's documents answers everyone the same, no matter who is asking. Real workplaces don't work like that. HR sees pay, engineers see the roadmap, contractors see the basics. An AI agent reading those same files needs the same limits a person would have.
+Give one AI assistant all of a company's documents, and it answers everyone the same way. Real companies don't work like that. HR sees pay, engineers see the roadmap, and contractors see the basics. An AI agent that reads those files needs the same limits as a person.
 
 ## How it works
 
@@ -16,11 +16,21 @@ company folders  ──►  roles.conf  ──►  nk setup  ──►  one sear
                       what)             checks agents)     that job needs)             the People team")
 ```
 
-- `roles.conf` lists each role and the folders it reads. A person or an AI agent is one more role.
-- Each role gets its own OpenClaw agent and its own search index, built only from its folders. Nothing is filtered at query time, because the other folders were never loaded.
-- `nk setup` applies the safety settings and re-checks 5 of them on every run. It also tests the AI key; a dead key drops search to keywords rather than failing.
-- A rule keeps each assistant on company work, and `nk` refuses any answer that cites none of the role's own documents. Ask it to fix your resume and you get a refusal, not help. The company name is one line in `roles.conf`.
-- `nk score` asks everyday questions as every role and grades the answers. The expected answers come from `roles.conf`, so the tests follow the access rules whenever they change.
+- `roles.conf` lists each role and the folders it may read. An AI agent can be a role too.
+- Each role gets its own OpenClaw agent and its own search. Both are built only from that role's folders. The other folders are never loaded, so there is nothing to filter later.
+- Every answer must name a file from the role's own folders. If it doesn't, `nk` shows a short "not available" message instead.
+- `nk setup` turns on the safety settings and checks 6 of them every time it runs. It also tests the AI key. If the key stops working, search falls back to keywords and keeps going.
+- `nk score` asks everyday questions as every role and grades the answers. It works out what each role should get from `roles.conf`, so the test follows the access rules when they change.
+
+## Safety features
+
+- Every document is checked for hidden instructions before any assistant sees it. A flagged file is kept for review and given to no one.
+- Assistants stay on company work. Ask one to fix your resume and it says no.
+- When the answer belongs to another team, the assistant offers to pass the question on. It sends a request (`nk handoffs`) only if the person says yes. Someone on that team decides what to share and replies by email. Nothing comes back on its own.
+- A handoff can't be used to get around the rules. The question is checked for hidden instructions, replies only go to company email addresses, repeat questions are dropped, and each person can have at most 5 open requests. The request also tells its reader that the asker's role comes from their login, so claims in the question don't count. `nk` picks the team from the public who-to-ask list and never searches that team's documents to do it.
+- `nk` watches for probing. If one role reaches for other teams' information 3 times in 10 minutes, `nk` records an alert. The person sees a short note that such requests are reviewed. One question with hidden instructions is enough. Questions passed on through a handoff don't count. `nk alerts` shows each alert with its evidence.
+- Every action goes into an audit log that can't be quietly edited. Each entry holds a fingerprint of the entry before it, and a small anchor file remembers the count and the last fingerprint. `nk log --verify` shows if any entry was changed, deleted, added, or cut off the end. `nk log --tamper-test` proves it on copies of the log.
+- The company's values are in the brain too (`public/company-values.md`), so every role can quote them.
 
 ## Who sees what (the demo company)
 
@@ -32,47 +42,86 @@ company folders  ──►  roles.conf  ──►  nk setup  ──►  one sear
 | hr | | | | ✅ |
 | finance | | | | |
 
-Access tracks what a job needs rather than seniority. `finance` belongs to no role, so no brain contains it.
+Access depends on what each job needs. `finance` belongs to no role, so no assistant has it.
 
-## Results
+## HydraDB
 
-Each role was asked the same everyday questions, and an automated grader checked every answer against its expected source.
+`nk` can also keep the documents in HydraDB. HydraDB searches by meaning as well as by keywords, and it builds a knowledge graph of the documents.
+
+HydraDB can give each document an access list. Its own SDK docs warn about two gaps: a document saved without an access list is open to everyone, and a search sent without one is not filtered. `nk` closes both gaps and adds a third check:
+
+1. Every document gets an access list from `roles.conf` (`group:needtoknow:<role>` for each role that may read it). `nk` refuses to upload a document without one, and every search names the role that is asking.
+2. Each folder is its own collection. A role only searches the collections it may read.
+3. `nk` checks every result again. If HydraDB ever returned a file from another role's folder, `nk` would drop it and warn.
+
+Only checked documents are uploaded. When `roles.conf` changes, the next upload updates the access lists and removes documents no role may read.
+
+Live results, with no AI involved:
+
+| Search for "salary" | Contractor | Support | Engineer | HR |
+|---|:-:|:-:|:-:|:-:|
+| Files returned | 0 | 0 | 0 | 2 |
+
+| `nk hydra-check`: every everyday question as every role | |
+|---|---|
+| Nothing returned from another role's folders | **57 / 57** searches |
+| Kept away from roles that may not read it | **19 / 19** |
+| Right document found when the role may read it | **25 / 25** ([report](results/hydra-check.md)) |
+| Knowledge graph fully on: hidden answers or hidden document names anywhere in HydraDB's reply | **0 / 13** cases we could test |
+
+**The graph test.** HydraDB's knowledge graph links facts across documents, so a fact could slip through a link. For every case where a role may not see the answer, `nk` asks again with the graph fully on. Then it searches everything HydraDB sent back for the hidden answer and for the names of documents that role can't see. It only counts words that appear in the hidden document and in none of the role's own documents, so any match would be a real leak.
+
+**Thinking mode.** `nk hydra-ask` uses HydraDB's thinking mode, which rewrites the question and re-ranks the results. We tested it on 10 questions worded differently from the documents. It put the right document first 8 times out of 10. The fast mode did that 4 times and missed one document completely ([measurement](results/thinking-vs-fast.md)).
+
+**The audit.** `nk hydra-audit` tests HydraDB's access one document at a time. It lists every stored document, including any in folders no role reads. Then it tries to open each one as every role and as a stranger with no role. It flags a document a stranger can open, a document the wrong role can open, and a document `nk` never uploaded. Live result: all 16 documents open only for the roles allowed, and for no stranger ([report](results/hydra-audit.md)). In testing, it caught a planted document with no access list and an HR file shared too widely.
+
+## Results on OpenClaw's own search
+
+Each role was asked the same everyday questions, and a grader checked every answer against the file it should come from.
 
 | | |
 |---|---|
-| Answer-quality score | **41 / 44 correct** ([full report](results/score-report.md)) |
+| Answer score | **41 / 44 correct** ([full report](results/score-report.md)) |
 | Nothing given outside a role's folders | **19 / 19** |
 | Correct answers that named their source file | **22 / 22** |
-| First-week briefs, every cited file in the role's own folder | yes ([contractor](results/brief-contractor.md), [HR](results/brief-hr.md)) |
+| First-week briefs, every cited file in the role's own folders | yes ([contractor](results/brief-contractor.md), [HR](results/brief-hr.md)) |
 
-The 3 misses were a role answering "I don't have that" about a fact sitting in its own folders, because search missed the file. That fails safe. The fix is already in the code: open the top match and read its full text.
+The 3 misses were a role saying "I don't have that" when the fact was in its own folders, because search missed the file. That is the safe way to be wrong. The fix is already in the code: open the best match and read the whole file.
 
 ## 5 OpenClaw defaults we changed
 
-We hit 5 defaults that are wrong for a shared, multi-role brain. `nk setup` fixes and checks all of them on every run:
+We found 5 default settings that are wrong for an assistant shared by many roles. `nk setup` fixes all 5 and checks them every time:
 
 1. **File tools could leave the agent's folder** → locked to its own folder (`tools.fs.workspaceOnly`)
-2. **Terminal commands were allowed** → denied (`exec-policy preset deny-all`)
-3. **"Remember across conversations" was on**, so one person's chats could surface in the next person's answers → off; search covers company documents only
-4. **12 unneeded add-ons sat in every prompt** → off (prompts 39% smaller)
-5. **A ChatGPT sign-in runs on OpenAI's Codex engine, which needs the terminal on** → switched to OpenClaw's own engine (`agentRuntime: openclaw`), so the terminal stays off
+2. **Terminal commands were allowed** → turned off (`exec-policy preset deny-all`)
+3. **"Remember across conversations" was on**, so one person's chats could show up in the next person's answers → off; search covers company documents only
+4. **12 add-ons nobody needed were in every prompt** → off (prompts 39% smaller)
+5. **A ChatGPT sign-in runs on OpenAI's Codex engine, which needs the terminal** → moved to OpenClaw's own engine (`agentRuntime: openclaw`), so the terminal stays off
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `nk setup [--prune]` | Make OpenClaw match `roles.conf`: create role agents, apply and check the settings |
-| `nk ingest-dir <folder>` | Load documents (Markdown, text, CSV, JSON, HTML, Word, PowerPoint, PDF, saved emails .eml/.mbox): each file is turned into searchable text, screened, and given only to the roles that may read its top-level folder. Files with hidden instructions are blocked |
-| `nk index` | Rebuild each role's search index from its own folder |
-| `nk ask <role> "question"` | Ask one role's brain; logged |
-| `nk brief <role>` | A one-page first-week brief for that role, with an automatic source check |
+| `nk setup [--prune]` | Make OpenClaw match `roles.conf`: create the role agents, turn on the safety settings, check them |
+| `nk ingest-dir <folder>` | Load documents (Markdown, text, CSV, JSON, HTML, Word, PowerPoint, PDF, saved emails .eml/.mbox). Each file becomes searchable text, is checked for hidden instructions, and goes only to the roles that may read its folder |
+| `nk index` | Rebuild each role's search from its own folder |
+| `nk ask <role> "question"` | Ask one role's assistant. If the answer belongs to another team, it offers to pass the question on |
+| `nk brief <role>` | A one-page first-week guide for that role, with every source checked |
 | `nk check` | Before a demo: does every role answer and search? |
-| `nk score [role …]` | The answer-quality report |
+| `nk score [role …]` | The answer report |
+| `nk handoffs` | Questions people chose to pass on to another team, with where to reply |
+| `nk alerts` | Probing alerts, with the evidence |
 | `nk who` · `nk search <role> "words"` · `nk log` | Who sees what, a search with no AI, and the audit log |
+| `nk log --verify` · `nk log --tamper-test` | Check the audit log, and prove the check catches edits and deletions (on copies) |
+| `nk hydra-push` | Upload every checked document to HydraDB, with access lists from `roles.conf` |
+| `nk hydra-search <role> "words"` · `nk hydra-check` | Search HydraDB as one role, and the no-AI test |
+| `nk hydra-audit` | Try every stored document as every role and as a stranger; flag anything the wrong people can open |
+| `nk hydra-ask <role> "question"` | Answer from what HydraDB returns for that role |
+| `nk hydra-reset --yes` | Delete the HydraDB database |
 
 ## Quick start
 
-Needs OpenClaw 2026.9.x running as its own user, Python 3, and an AI: a key (free Gemini works) **or** a ChatGPT plan signed in per role (`openclaw models auth login --provider openai --device-code --agent <role>`; `nk setup` runs it on OpenClaw's own engine).
+You need OpenClaw 2026.9.x running as its own user, Python 3, and an AI. For the AI, use a key (free Gemini works) **or** a ChatGPT plan signed in for each role with `openclaw models auth login --provider openai --device-code --agent <role>`. `nk setup` runs ChatGPT on OpenClaw's own engine.
 
 ```bash
 mkdir -p ~/needtoknow && cp nk.py roles.conf score-questions.conf ~/needtoknow/
@@ -84,12 +133,25 @@ python3 ~/needtoknow/nk.py ingest-dir ~/needtoknow/northwind-docs && python3 ~/n
 python3 ~/needtoknow/nk.py check && python3 ~/needtoknow/nk.py score
 ```
 
+Optional HydraDB storage:
+
+```bash
+python3 -m venv ~/needtoknow/.venv && ~/needtoknow/.venv/bin/pip install "hydradb-sdk>=2.1.1,<3"
+(umask 077; read -rsp "HydraDB key: " K; echo; printf "%s" "$K" > ~/needtoknow/.secrets/hydradb.key)
+python3 ~/needtoknow/nk.py hydra-push && python3 ~/needtoknow/nk.py hydra-check
+```
+
 ## Honest limits
 
-- The login is simulated. In the demo you pick the role; in real use the company's single sign-on maps each person to a role.
-- It suits a handful of roles. For thousands of permission groups you would filter at search time instead of copying documents per role.
-- Documents only, with no live Slack, Drive, or Gmail connectors yet. Any export works once it is sorted into folders.
-- The isolation rests on OpenClaw's tool settings. A separate sandbox or a Linux user per role would be stronger.
+- The login is simulated: in the demo you pick the role. In real use, the company login would set each person's role.
+- It suits a few roles. With thousands of permission groups, you would filter at search time instead of copying documents to each role.
+- It reads documents only. There are no live Slack, Drive, or Gmail connections yet, but any export works once it is sorted into folders.
+- The separation between roles depends on OpenClaw's tool settings. A separate sandbox or Linux user for each role would be stronger.
+- The HydraDB numbers measure search: the right document comes back for the right role. The AI-graded score above used OpenClaw's own search.
+- A handoff is a request file in a queue that the team reads with `nk handoffs`. It isn't emailed to the team yet, and the reply goes by email outside `nk`. In the demo the person types their work email; in real use it would come from their login.
+- Chats in the OpenClaw dashboard skip `nk`, so they don't offer handoffs or get the answer check.
+- Alerts are per role because the login is simulated. With a real login they would be per person. The limit (3 in 10 minutes) is a setting. An alert means someone should take a look; it doesn't prove bad intent.
+- The log and its anchor are on the same machine, so someone with full access to that machine could rewrite both. `nk log --verify` prints the latest fingerprint. Write it down somewhere else: if the log is ever rewritten, the fingerprint for the same entries changes. Entries from before the chain started aren't protected.
 
 ---
 

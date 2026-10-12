@@ -8,3 +8,7 @@ workspaces/
 briefs/
 reports/
 __pycache__/
+.venv/
+.pylib/
+hydradb.json
+outbox/

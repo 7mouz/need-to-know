@@ -6,7 +6,7 @@ Northwind makes **NorthwindFlow**, a project-management app.
 
 ## Who needs what (the access map)
 
-Access follows what each job needs rather than seniority.
+Access follows what each job needs.
 
 | Folder | What's inside | Contractor | Support | Engineer | HR | Ask if you can't see it |
 |---|---|:-:|:-:|:-:|:-:|---|
@@ -19,7 +19,7 @@ Access follows what each job needs rather than seniority.
 | `hr` | Salary ranges, hiring plan | | | | ✅ | People team (HR) |
 | `finance` | Vendor list, cloud budget | | | | | Finance team |
 
-`finance` is assigned to nobody, so it isn't loaded into any brain at all: a folder nobody is assigned stays closed.
+No role reads `finance`, so it isn't loaded into any assistant. A folder no role reads stays closed.
 
 ## Facts that connect across sources
 

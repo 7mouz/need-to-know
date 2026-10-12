@@ -15,7 +15,8 @@ Commands:
                                 and saved emails (.eml, .mbox)
                                 are turned into searchable text, and every file is screened first
   nk.py ingest <file> <folder>  Load one file as if it sat in <folder>
-  nk.py ask <role> <question>   Ask one role's agent (the role is the simulated login)
+  nk.py ask <role> <question>   Ask one role's agent (the role is the simulated login). If the answer belongs to
+                                another team, it offers to pass the question on (only after a yes)
   nk.py brief <role>            Have a role's agent write a first-week brief; saved to briefs/; sources checked
   nk.py check                   Before a demo: does every role answer (AI) and search (no AI)? Shows the model used
   nk.py score [role ...]        Ask the everyday questions (score-questions.conf) as every role; save a report
@@ -23,7 +24,23 @@ Commands:
   nk.py search <role> <words>   Search one role's own documents directly (no AI): a quick who-sees-what check
   nk.py who                     Show which documents each role can see
   nk.py log [N]                 Show the last N audit-log entries (default 20)
+  nk.py log --verify            Check the log's chain: no entry changed, deleted, inserted, or cut off the end
+  nk.py log --tamper-test       Prove it: edit and delete entries in COPIES of the log and show both get caught
+  nk.py handoffs                Show questions people chose to pass on to another team (a person there decides)
+  nk.py alerts                  Show probing alerts: a role repeatedly reaching for other teams' information
   nk.py reset --yes             Empty every agent's shelf (source files are untouched)
+
+HydraDB (optional storage; needs the hydradb-sdk and a key in .secrets/hydradb.key):
+  nk.py hydra-push              Copy every screened document to HydraDB: one collection per folder, and an ACL
+                                from roles.conf on every document (nothing is uploaded without one)
+  nk.py hydra-search <role> <words>  Search HydraDB as one role (no AI); the role's ACL and collections always apply
+  nk.py hydra-audit             Probe every document in HydraDB as each role AND as a stranger; flag anything
+                                readable by the wrong people, uploaded without nk, or open to everyone (no AI)
+  nk.py hydra-check             No-AI proof on HydraDB: every everyday question as every role, expected results
+                                from roles.conf; also scans the knowledge graph for restricted answers
+  nk.py hydra-ask <role> <question>  Answer from HydraDB excerpts retrieved with that role's ACL, in thinking
+                                mode, with the role's profile and the company values as context (one AI call)
+  nk.py hydra-reset --yes       Delete the HydraDB database
 
 'open-brain' always exists and gets every loaded document: the "before" brain for the demo.
 """
@@ -33,6 +50,8 @@ import difflib
 import email
 import email.errors
 import email.policy
+import fcntl
+import hashlib
 import html.parser
 import json
 import mailbox
@@ -42,6 +61,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -55,10 +75,17 @@ ROLES_FILE = BASE / "roles.conf"
 SHELVES = BASE / "workspaces"                      # one workspace (folder) per agent
 QUARANTINE = BASE / "quarantine"
 AUDIT_LOG = BASE / "audit.log"
+AUDIT_HEAD = BASE / "audit.log.head"                # anchor: entry count + fingerprint of the last entry
 KEY_FILE = BASE / ".secrets" / "model.key"         # optional: only `setup` reads it, to give new agents the AI key
 BRIEFS = BASE / "briefs"                           # saved first-week briefs (outside every agent's folder)
 QUESTIONS_FILE = BASE / "score-questions.conf"     # everyday questions for `nk score`
 REPORTS = BASE / "reports"                         # saved score reports
+OUTBOX = BASE / "outbox"                           # handoff requests, one folder per team (no agent can read it)
+HANDOFF_MAX_OPEN = 5                               # open requests per person, so the queue can't be flooded
+HANDOFF_MAX_CHARS = 500                            # a question, not a document
+PROBE_WINDOW_MIN = 10                              # probing alert: this many signals from one role...
+PROBE_THRESHOLD = 3                                # ...within this many minutes (one hidden-instruction question is enough)
+VALUES_DOC = "public/company-values.md"            # the company's values; added to every HydraDB answer call
 BEFORE_BRAIN = "open-brain"
 DEFAULT_MODEL = "google/gemini-flash-lite-latest"
 
@@ -109,13 +136,148 @@ def utc_now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
 
+def _fingerprint(line):
+    return hashlib.sha256(line.encode("utf-8")).hexdigest()
+
+
+def _last_line(f):
+    """The last line of an open binary file (no newline), or None if the file is empty. Reads from the end."""
+    f.seek(0, os.SEEK_END)
+    pos, buf = f.tell(), b""
+    while pos > 0:
+        step = min(4096, pos)
+        pos -= step
+        f.seek(pos)
+        buf = f.read(step) + buf
+        body = buf[:-1] if buf.endswith(b"\n") else buf
+        if b"\n" in body:
+            return body.rsplit(b"\n", 1)[1].decode("utf-8")
+    body = buf[:-1] if buf.endswith(b"\n") else buf
+    return body.decode("utf-8") if body else None
+
+
 def audit(event, **fields):
-    """Append one JSON line to the audit log (readable only by the openclaw user)."""
-    record = {"ts": utc_now(), "event": event, **fields}
+    """Append one JSON line to the audit log (readable only by the openclaw user).
+    Tamper-evident: each line carries the fingerprint of the line before it, so a changed, deleted or inserted
+    entry breaks the chain, and an anchor file remembers the count and the last fingerprint, so cutting entries
+    off the end shows too. If the end changed between two writes, that is recorded IN the chain, not repaired."""
     AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with open(AUDIT_LOG, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record) + "\n")
+    with open(AUDIT_LOG, "a+b") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)                  # two nk commands at once still make one clean chain
+        try:
+            last = _last_line(f)
+            try:
+                head = json.loads(AUDIT_HEAD.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                head = None
+            if head and last is not None and head.get("last") != _fingerprint(last):
+                f.seek(0)
+                actual = sum(1 for _ in f)
+                warn = {"ts": utc_now(), "event": "audit-anchor-mismatch",
+                        "anchor_entries": head.get("lines"), "anchor_last": str(head.get("last"))[:16],
+                        "file_entries": actual, "file_last": _fingerprint(last)[:16], "prev": _fingerprint(last)}
+                line = json.dumps(warn)
+                f.seek(0, os.SEEK_END)
+                f.write((line + "\n").encode("utf-8"))
+                last, count = line, actual + 1
+            elif head and last is not None:
+                count = int(head.get("lines", 0))
+            else:                                       # first chained write (or no anchor yet): count once
+                f.seek(0)
+                count = sum(1 for _ in f)
+            record = {"ts": utc_now(), "event": event, **fields,
+                      "prev": _fingerprint(last) if last is not None else "genesis"}
+            line = json.dumps(record)
+            f.seek(0, os.SEEK_END)
+            f.write((line + "\n").encode("utf-8"))
+            f.flush()
+            AUDIT_HEAD.write_text(json.dumps({"lines": count + 1, "last": _fingerprint(line)}), encoding="utf-8")
+            os.chmod(AUDIT_HEAD, 0o600)
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
     os.chmod(AUDIT_LOG, 0o600)
+
+
+def verify_log(path=None, show=True):
+    """Walk the chain. Returns (ok, problems). The anchor is checked only for a log that has one."""
+    path = pathlib.Path(path) if path else AUDIT_LOG
+    if not path.exists():
+        sys.exit(f"No log at {path}")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    start = next((i for i, l in enumerate(lines) if '"prev":' in l), None)
+    problems = []
+    if start is not None:
+        for i in range(start, len(lines)):
+            try:
+                rec = json.loads(lines[i])
+            except ValueError:
+                problems.append(f"entry {i + 1} is not valid JSON: it was edited or corrupted")
+                continue
+            expected = _fingerprint(lines[i - 1]) if i > 0 else "genesis"
+            if rec.get("prev") != expected:
+                problems.append(f"entry {i + 1} doesn't match entry {i}: entry {i} was changed, "
+                                "or an entry was deleted or inserted here")
+            if rec.get("event") == "audit-anchor-mismatch":
+                problems.append(f"entry {i + 1} records that the end of the log changed between two writes "
+                                f"(anchor said {rec.get('anchor_entries')} entries, the file had {rec.get('file_entries')})")
+    head_path = path.with_name(path.name + ".head")
+    anchor = ("no anchor yet (the next nk command creates it)" if path == AUDIT_LOG
+              else "no anchor file (checking a copy)")
+    if head_path.exists() and lines:
+        head = json.loads(head_path.read_text(encoding="utf-8"))
+        anchor = f"{head.get('lines')} entries, last fingerprint {str(head.get('last'))[:16]}"
+        if head.get("lines") != len(lines) or head.get("last") != _fingerprint(lines[-1]):
+            n = head.get("lines") or 0
+            why = ("the last entry was changed" if n == len(lines)
+                   else f"{n - len(lines)} entr{'y was' if n - len(lines) == 1 else 'ies were'} removed" if n > len(lines)
+                   else f"{len(lines) - n} entr{'y was' if len(lines) - n == 1 else 'ies were'} added outside nk")
+            problems.append(f"the anchor says {n} entries ending in {str(head.get('last'))[:12]}, but the log has "
+                            f"{len(lines)} ending in {_fingerprint(lines[-1])[:12]}: {why}")
+    if show:
+        chained = 0 if start is None else len(lines) - start
+        print(f"Audit log: {len(lines)} entries · {chained} chained"
+              + (f" · {start} older entries written before the chain started (not protected)" if start else ""))
+        print(f"Anchor:    {anchor}")
+        if lines:
+            print(f"Head:      {_fingerprint(lines[-1])[:16]}  (note it down: if a later check shows a different head "
+                  "for the same entries, the log was rewritten)")
+        if problems:
+            print(f"\n❌ {len(problems)} problem(s):")
+            for p in problems[:10]:
+                print(f"   - {p}")
+        elif start is None:
+            print("\nNo chained entries yet: the chain starts with the next nk command that writes to the log.")
+        else:
+            print("\n✅ Chain intact: no entry was changed, deleted, or inserted, and nothing was cut off the end.")
+    return not problems, problems
+
+
+def tamper_test():
+    """Prove the chain works, on COPIES of the log: change one entry, delete another, verify each copy.
+    The real log is never touched."""
+    lines = AUDIT_LOG.read_text(encoding="utf-8").splitlines() if AUDIT_LOG.exists() else []
+    chained = [i for i, l in enumerate(lines) if '"prev":' in l]
+    if len(chained) < 4:
+        sys.exit("Need a few chained entries first. Run some nk commands (for example nk who; nk search hr salary).")
+    edit_at, delete_at = chained[len(chained) // 3], chained[2 * len(chained) // 3]
+    rec = json.loads(lines[edit_at])
+    field = next((k for k in ("outcome", "role", "hits", "event") if k in rec), "event")
+    old = rec[field]
+    rec[field] = ("answered" if field == "outcome" else "hr" if field == "role" else 99 if field == "hits"
+                  else f"{old}-edited")
+    if rec[field] == old:
+        rec[field] = f"{old}-edited"
+    edited = lines[:edit_at] + [json.dumps(rec)] + lines[edit_at + 1:]
+    deleted = lines[:delete_at] + lines[delete_at + 1:]
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, content, what in (("edited", edited, f"changed entry {edit_at + 1}: {field} {old!r} -> {rec[field]!r}"),
+                                    ("deleted", deleted, f"deleted entry {delete_at + 1}")):
+            copy = pathlib.Path(tmp) / f"audit-{name}.log"
+            copy.write_text("\n".join(content) + "\n", encoding="utf-8")
+            ok, problems = verify_log(copy, show=False)
+            print(f"Copy with {what}:")
+            print(f"   {'❌ NOT caught' if ok else '✅ caught: ' + problems[0]}")
+    print("\nThe real log was not touched. Check it with: nk log --verify")
 
 
 def oc(*args, stdin_text=None, timeout=90):
@@ -144,7 +306,7 @@ def load_config():
         if key == "model":
             model = value.strip()
             continue
-        if key in ("ask", "company"):    # read by load_owners() / load_company()
+        if key in ("ask", "company", "email-domain"):    # read by load_owners() / load_company() / handoffs
             continue
         if not ROLE_NAME.match(key) or key == BEFORE_BRAIN:
             sys.exit(f"roles.conf line {n}: bad role name {key!r} "
@@ -153,6 +315,16 @@ def load_config():
     if not roles:
         sys.exit("roles.conf lists no roles.")
     return model, roles
+
+
+def load_email_domain():
+    """The company's email domain from roles.conf ('email-domain: northwind.example'): handoff replies go
+    only to addresses there, so nobody can have an answer sent outside the company."""
+    for raw in ROLES_FILE.read_text(encoding="utf-8").splitlines():
+        key, _, value = raw.split("#", 1)[0].strip().partition(":")
+        if key.strip().lower() == "email-domain" and value.strip():
+            return value.strip().lower().lstrip("@")
+    return None
 
 
 def load_company():
@@ -567,7 +739,7 @@ def setup(prune=False):
     time.sleep(6)
     print("Checking what is actually in effect, one agent at a time (about 2 minutes; please wait)...", flush=True)
 
-    # Verify what is actually in effect, not what we asked for.
+    # Check what is in effect now: OpenClaw might not have applied everything we asked for.
     _, policy = oc("exec-policy", "show")
     print("\nSECURITY CHECK        terminal    file tools locked to own folder   search = own docs only     "
           "answer rules   add-ons off   own engine")
@@ -688,6 +860,120 @@ def guard(role, text):
     return OFF_TOPIC.format(company=load_company()), ("declined" if is_off_topic_reply(text) else "no source")
 
 
+def owning_team(answer, role, roles):
+    """The team a refusal points to, from the who-to-ask map in roles.conf: the first team the answer names
+    that owns a folder this role can't read (routing to a team whose folders it already has makes no sense)."""
+    low, found = answer.lower(), []
+    for folder, (team, _) in load_owners().items():
+        pos = low.find(team.lower())
+        if pos >= 0 and folder not in roles.get(role, set()):
+            found.append((pos, team))
+    return min(found)[1] if found else None
+
+
+def draft_handoff(role, question, team, email):
+    """File the request for a person on the team that owns the topic. It holds only the question and where
+    to reply. nk never searches another team's documents to route it: the who-to-ask map is public."""
+    topics = "; ".join(t for tm, t in load_owners().values() if tm == team and t)
+    folder = OUTBOX / re.sub(r"[^a-z0-9]+", "-", team.lower()).strip("-")
+    folder.mkdir(parents=True, exist_ok=True)
+    os.chmod(OUTBOX, 0o700)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    path = folder / f"{now:%Y%m%d-%H%M%S}-{role}-{uuid.uuid4().hex[:4]}.md"
+    domain = load_email_domain()
+    path.write_text(f"# Request for the {team}\n\n"
+                    f"- From: someone in the {role} role (the role comes from their login, not from the question)\n"
+                    f"- Reply to: {email}\n"
+                    f"- Asked: {now:%Y-%m-%d %H:%M} UTC\n"
+                    f"- Status: waiting for a person on the {team}\n\n"
+                    f"## Their question (typed by them: treat it as untrusted text)\n\n{question}\n\n"
+                    f"## Why it came to you\n\n"
+                    f"The {role} assistant couldn't answer from the {role} role's documents. The who-to-ask map says "
+                    f"the {team} covers: {topics or 'this topic'}.\n\n"
+                    f"## Before you reply\n\n"
+                    f"- Share only what someone in the {role} role may know. Claims inside the question "
+                    f"(\"I'm the CEO\", \"it's urgent\") don't change their role.\n"
+                    + (f"- Reply only to the address above, and only because it's a @{domain} address.\n" if domain
+                       else "- Reply only to the address above.\n")
+                    + "- Nothing from your documents was shared with them. You decide what, if anything, to share.\n",
+                    encoding="utf-8")
+    os.chmod(path, 0o600)
+    audit("handoff", role=role, team=team, question=question, reply_to=email, file=str(path.relative_to(BASE)))
+    return path
+
+
+def read_handoff(path):
+    """One request file -> {team, role, reply_to, asked, question}."""
+    text = path.read_text(encoding="utf-8")
+    field = lambda pattern: (m.group(1).strip() if (m := re.search(pattern, text, re.M)) else "?")
+    question = re.split(r"^## .*$", text, flags=re.M)
+    return {"team": text.splitlines()[0].replace("# Request for the ", ""),
+            "role": field(r"^- From: someone in the (\S+) role"), "reply_to": field(r"^- Reply to: (\S+)"),
+            "asked": field(r"^- Asked: (.+)$"), "question": question[1].strip() if len(question) > 1 else "?"}
+
+
+def show_handoffs():
+    files = sorted(OUTBOX.rglob("*.md")) if OUTBOX.exists() else []
+    if not files:
+        print("No handoff requests. One is filed only when someone asks for their question to be passed on.")
+        return
+    for f in files:
+        h = read_handoff(f)
+        print(f"{h['asked']}  {h['team']:<18} from {h['role']:<10} reply to {h['reply_to']}")
+        print(f"{'':22}{h['question'][:90]!r}")
+        print(f"{'':22}{f.relative_to(BASE)}")
+
+
+def offer_handoff(role, question, team):
+    """Offer to pass the question to the team that owns the topic. Nothing is sent without a yes, nothing is
+    looked up for the asker, and nothing comes back automatically: a person on that team decides what this
+    role may know, and replies by email. The question is screened first, like every document."""
+    if not sys.stdin.isatty():
+        print(f"(The {team} owns this. Ask in a terminal to have your question passed on to them.)")
+        return None
+    hits = screen(question)
+    if hits:
+        audit("handoff-refused", role=role, team=team, question=question[:200], reason=hits)
+        print(f"\nI can't pass this question on as written: it contains instructions aimed at an AI ({hits[0]!r}).\n"
+              "Ask it as a plain question. Nothing was sent.")
+        return None
+    if len(question) > HANDOFF_MAX_CHARS:
+        print(f"\nThat question is too long to pass on (over {HANDOFF_MAX_CHARS} characters). Nothing was sent.")
+        return None
+    domain = load_email_domain()
+    print(f"\nThe {team} owns this topic. I can pass your question on to them:\n"
+          f"  - A person on that team reads it and decides what, if anything, the {role} role may know.\n"
+          f"  - If they share, they reply to your work email. Nothing is looked up or shared automatically.")
+    try:
+        if input(f"Send your question to the {team}? (y/n): ").strip().lower() not in ("y", "yes"):
+            print("OK, nothing was sent.")
+            return None
+        for _ in range(2):
+            email = input(f"Your work email{f' (@{domain})' if domain else ''}: ").strip().lower()
+            if (re.fullmatch(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", email)
+                    and (not domain or email.endswith("@" + domain))):
+                break
+            print(f"That isn't {'a @' + domain if domain else 'an email'} address. Replies go only to company addresses.")
+        else:
+            print("Nothing was sent.")
+            return None
+    except (EOFError, KeyboardInterrupt):
+        print("\nNothing was sent.")
+        return None
+    mine = [h for h in map(read_handoff, OUTBOX.rglob("*.md")) if h["reply_to"] == email] if OUTBOX.exists() else []
+    norm = lambda q: " ".join(q.lower().split())
+    if any(h["team"] == team and norm(h["question"]) == norm(question) for h in mine):
+        print(f"You already sent this question to the {team}. They'll reply to {email}.")
+        return None
+    if len(mine) >= HANDOFF_MAX_OPEN:
+        print(f"You have {len(mine)} questions waiting for replies. Nothing new was sent until some are answered.")
+        return None
+    path = draft_handoff(role, question, team, email)
+    print(f"\nHANDOFF  Sent to the {team}'s queue: {path.relative_to(BASE)}\n"
+          f"         If they decide to share, they'll reply to {email}.")
+    return path
+
+
 def ask(role, question):
     _, roles = load_config()
     if role not in [*roles, BEFORE_BRAIN]:
@@ -705,10 +991,14 @@ def ask(role, question):
     audit("ask", role=role, question=question, outcome=outcome, model=model, tries=tries, answer=answer[:300],
           **({"ai_wrote": raw[:300], "why": why} if why else {}))
     print(answer)
+    team = owning_team(answer, role, roles) if outcome == "refused" and role != BEFORE_BRAIN else None
     print(f"\n[logged: role={role}, outcome={outcome}, model={model}" + (f", tries={tries}" if tries > 1 else "")
           + {"no source": ", BLOCKED BY CODE: the answer named none of this role's documents",
              "declined": ", the AI declined by itself (rule 9); fixed reply shown",
              "not available": ", not in this role's documents; fixed reply shown"}.get(why, "") + "]")
+    if team:
+        offer_handoff(role, question, team)
+    check_probing(role)
 
 
 def check():
@@ -779,7 +1069,7 @@ def score(only_roles=None, pause=3):
             print(f"[{len(results) + 1}/{total}] {role:<10} {q[:60]}", file=sys.stderr)
             ok, text, model, _ = run_agent(role, q, "score")
             if ok:
-                text, _ = guard(role, text)          # score what a user would actually get
+                text, _ = guard(role, text)          # score what a user would see
             has_words = all(phrase_found(w, text) for w in words)
             if not ok:
                 result = "error"
@@ -875,7 +1165,7 @@ def index():
         rc, out = oc("memory", "index", "--agent", role, "--force", timeout=300)
         if rc != 0 and "fts-only fallback mode" in out:
             # No working AI key: OpenClaw won't overwrite the old meaning-search index with a keyword one.
-            # Clear just the derived index (documents and chats are untouched), then rebuild with keywords.
+            # Clear only the search index (documents and chats stay), then rebuild it with keywords.
             oc("memory", "reset", "--agent", role, "--yes", timeout=120)
             rc, out = oc("memory", "index", "--agent", role, "--force", timeout=300)
             out += "  (rebuilt with keywords only)"
@@ -901,20 +1191,111 @@ def search_files(role, query):
     return files, ""
 
 
+def restricted_topic(role, roles, text):
+    """Admin-side check (the person only sees 0 results): do ALL the words appear in some document outside
+    this role's folders, and in none of its own? Then the search reached for another team's information."""
+    words = [w for w in re.findall(r"[\w$.,-]+", text) if len(w) > 1]
+    if role == BEFORE_BRAIN or role not in roles or not words:
+        return False
+    match = lambda t: all(phrase_found(w, t) for w in words)
+    mine = SHELVES / role / "knowledge"
+    if mine.exists() and any(match(p.read_text(encoding="utf-8")) for p in mine.rglob("*.md")):
+        return False
+    shelf = SHELVES / BEFORE_BRAIN / "knowledge"
+    return shelf.exists() and any(
+        str(p.relative_to(shelf)).split("/", 1)[0].lower() not in roles[role] and match(p.read_text(encoding="utf-8"))
+        for p in shelf.rglob("*.md"))
+
+
+def _recent_records(n=600):
+    if not AUDIT_LOG.exists():
+        return []
+    out = []
+    for line in AUDIT_LOG.read_text(encoding="utf-8").splitlines()[-n:]:
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return out
+
+
+def probe_signals(records, role, since):
+    """Probe-like events for one role since a time: [(ts, what, text, severe)].
+    A refusal the person then passed on through a handoff doesn't count: that's the proper channel, and every
+    handoff is accountable (a company email, at most 5 open, read by a person on the owning team)."""
+    handed_off = {r.get("question") for r in records
+                  if r.get("event") == "handoff" and r.get("role") == role and str(r.get("ts", "")) >= since}
+    out = []
+    for r in records:
+        if r.get("role") != role or str(r.get("ts", "")) < since:
+            continue
+        ev = r.get("event")
+        if ev in ("ask", "hydra-ask") and r.get("outcome") == "refused" and r.get("question") in handed_off:
+            continue
+        if ev in ("ask", "hydra-ask") and r.get("outcome") == "refused":
+            out.append((r["ts"], "asked for something outside its documents", r.get("question", ""), False))
+        elif ev in ("ask", "hydra-ask") and r.get("outcome") == "off-topic" and r.get("why") == "no source":
+            out.append((r["ts"], "answer blocked: it cited none of its documents", r.get("question", ""), False))
+        elif ev in ("search", "hydra-search") and r.get("restricted"):
+            out.append((r["ts"], "searched for a topic only in other teams' folders", r.get("query", ""), False))
+        elif ev == "handoff-refused":
+            out.append((r["ts"], "question with instruction-like text", r.get("question", ""), True))
+    return out
+
+
+def check_probing(role):
+    """After an action: if this role crossed the line in the last few minutes, record ONE alert per window (in
+    the tamper-evident log) and show a neutral notice. The person learns requests are reviewed, not that they
+    were flagged, and nothing they get back changes."""
+    if role == BEFORE_BRAIN:
+        return
+    records = _recent_records()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    since = (now - datetime.timedelta(minutes=PROBE_WINDOW_MIN)).isoformat(timespec="seconds")
+    actions = [r for r in records if r.get("role") == role
+               and r.get("event") in ("ask", "hydra-ask", "search", "hydra-search", "handoff-refused")]
+    if not actions or not probe_signals([*actions[-1:], *(r for r in records if r.get("event") == "handoff")],
+                                        role, since):
+        return                                         # this action wasn't a reach outside the role: say nothing
+    signals = probe_signals(records, role, since)
+    if len(signals) < PROBE_THRESHOLD and not any(sev for *_, sev in signals):
+        return
+    if not any(r.get("event") == "probe-alert" and r.get("role") == role and str(r.get("ts", "")) >= since
+               for r in records):
+        audit("probe-alert", role=role, signals=len(signals), window_min=PROBE_WINDOW_MIN,
+              evidence=[f"{ts[11:19]} {what}: {text[:60]!r}" for ts, what, text, _ in signals[-5:]])
+    print("\nNOTE     Requests for information outside your role are logged and reviewed.")
+
+
+def show_alerts():
+    alerts = [r for r in _recent_records(100000) if r.get("event") == "probe-alert"]
+    if not alerts:
+        print(f"No probing alerts. One is raised when a role makes {PROBE_THRESHOLD} reaches for other teams' "
+              f"information within {PROBE_WINDOW_MIN} minutes, or asks a question with hidden instructions.")
+        return
+    for a in alerts:
+        print(f"{a['ts']}  {a['role']:<10} {a['signals']} signal(s) within {a['window_min']} min")
+        for e in a.get("evidence", []):
+            print(f"{'':27}{e}")
+
+
 def search(role, query):
     """Search one role's own documents directly. Free, so it's a quick who-sees-what check."""
     _, roles = load_config()
     if role not in [*roles, BEFORE_BRAIN]:
         sys.exit(f"Unknown role '{role}'. Use one of: {', '.join(roles)} (or {BEFORE_BRAIN})")
     files, raw = search_files(role, query)
-    if files is None:
+    searched = files is not None
+    if not searched:
         print(raw or "(search failed)")
         files = []
     else:
         print(f"{role}: {len(files)} file(s) match {query!r}")
         for f in files:
             print(f"    {f}")
-    audit("search", role=role, query=query, hits=len(files), files=files)
+    restricted = searched and not files and restricted_topic(role, roles, query)   # a failed search never counts
+    audit("search", role=role, query=query, hits=len(files), files=files, restricted=restricted)
+    check_probing(role)
 
 
 def who():
@@ -962,6 +1343,31 @@ def show_log(n=20):
             print(f"{ts}  BRIEF  {r['role']:<10} {check}")
         elif ev == "search":
             print(f"{ts}  SEARCH {r['role']:<10} {r['hits']:>2} file(s)  {r['query'][:50]!r}")
+        elif ev == "hydra-push":
+            print(f"{ts}  HYDRA  pushed {r['pushed']} doc(s) to {r['database']} ({len(r['collections'])} collections)"
+                  f", ACLs updated {r['acl_updated']}, removed {r['removed']}")
+        elif ev == "hydra-search":
+            print(f"{ts}  HSRCH  {r['role']:<10} {r['hits']:>2} file(s)  {r['query'][:50]!r}"
+                  + (f"  DROPPED {len(r['dropped'])}" if r.get("dropped") else ""))
+        elif ev == "hydra-check":
+            print(f"{ts}  HCHECK held {r['held']}/{r['queries']} · found {r['found']}/{r['should_find']}"
+                  f" · kept away {r['blocked']}/{r['should_block']}"
+                  + (f" · graph leaks {r['graph_leaks']}/{r['graph_tested']}" if "graph_tested" in r else ""))
+        elif ev == "hydra-ask":
+            print(f"{ts}  HASK   {r['role']:<10} {r['outcome']:<8} {r['question'][:60]!r}")
+        elif ev == "handoff":
+            print(f"{ts}  HANDOFF {r['role']:<9} -> {r['team']:<18} {r['question'][:50]!r}")
+        elif ev == "handoff-refused":
+            print(f"{ts}  NOSEND  {r['role']:<9} -> {r['team']:<18} instruction-like text: {r['reason']}")
+        elif ev == "hydra-audit":
+            print(f"{ts}  HAUDIT stored {r['stored']} · critical {len(r['critical'])} · shadow {r['shadow']} · unreachable {r['unreachable']}")
+        elif ev == "probe-alert":
+            print(f"{ts}  PROBE  {r['role']:<10} {r['signals']} reach(es) for other teams' information within {r['window_min']} min")
+        elif ev == "audit-anchor-mismatch":
+            print(f"{ts}  !!LOG  the end of the log changed between writes (anchor {r.get('anchor_entries')} entries, "
+                  f"file {r.get('file_entries')})")
+        elif ev == "hydra-reset":
+            print(f"{ts}  HYDRA  database {r['database']} deleted")
 
 
 def reset(confirm):
@@ -976,6 +1382,516 @@ def reset(confirm):
         shelf.mkdir(parents=True, exist_ok=True)
     audit("reset")
     print("All shelves emptied. Load documents again with: nk.py ingest-dir <dataset>")
+
+
+# ---------------------------------------------------------------- HydraDB (optional storage backend)
+#
+# HydraDB's access lists have two gaps (from its SDK docs):
+#   1. a document saved WITHOUT an `acl` has no limits: anyone can retrieve it;
+#   2. a search WITHOUT an `acl` (or with an empty one, or ["*"]) is not filtered at all.
+# nk closes both. Lock 1: every document gets an access list from roles.conf and is never uploaded without one,
+# and every search names the role that is asking. Lock 2: each folder is its own collection, and a role only
+# searches the collections of folders it may read. Lock 3: nk checks every result again and drops (and reports)
+# anything from a folder the role may not read. Only checked documents are uploaded: they come from the shelves,
+# where quarantined files never land, and they are checked again on the way out.
+
+HYDRA_KEY_FILE = BASE / ".secrets" / "hydradb.key"
+HYDRA_STATE = BASE / "hydradb.json"          # what was uploaded: the database, and each document's collection + ACL
+HYDRA_VENV = BASE / ".venv"                  # the SDK lives here, so the system Python stays untouched
+HYDRA_LIB = BASE / ".pylib"                  # or here: unpacked wheels, for a box without pip or venv
+HYDRA_INSTALL = 'python3 -m venv ~/needtoknow/.venv && ~/needtoknow/.venv/bin/pip install "hydradb-sdk>=2.1.1,<3"'
+HYDRA_ASK_MODE = "thinking"                  # hydra-ask: query expansion + reranking (measured: right doc first 8/10 vs 4/10)
+HYDRA_PRINCIPAL = "group:needtoknow:{role}"  # one identity per role (if HydraDB rejects it, use "{role}@roles.needtoknow.example")
+
+
+def hydra_principal(role):
+    return HYDRA_PRINCIPAL.format(role=role)
+
+
+def hydra_collection(folder):
+    """A folder's collection id: 'product-docs' -> 'product_docs'."""
+    return re.sub(r"[^a-z0-9]+", "_", folder.lower()).strip("_")
+
+
+def hydra_database():
+    return "needtoknow-" + (re.sub(r"[^a-z0-9]+", "-", load_company().lower()).strip("-") or "company")
+
+
+def hydra_id(rel):
+    """A stable document id from its path: 'hr/salary-ranges.md' -> 'nk_hr_salary_ranges_md_<6 hex>'."""
+    return "nk_" + re.sub(r"[^a-z0-9]+", "_", rel.lower()).strip("_") + "_" + hashlib.sha1(rel.encode()).hexdigest()[:6]
+
+
+def hydra_client():
+    """Connect with the key in .secrets/hydradb.key (or $HYDRA_DB_API_KEY). The key is never printed."""
+    for site in [*sorted(HYDRA_VENV.glob("lib/python3*/site-packages")), HYDRA_LIB]:
+        if site.is_dir() and str(site) not in sys.path:
+            sys.path.insert(0, str(site))
+    try:
+        from hydra_db import HydraDB
+    except ImportError:
+        sys.exit("The HydraDB SDK isn't installed. One time, as the openclaw user:\n  " + HYDRA_INSTALL)
+    key = os.environ.get("HYDRA_DB_API_KEY", "").strip()
+    if not key and HYDRA_KEY_FILE.exists():
+        key = HYDRA_KEY_FILE.read_text(encoding="utf-8").strip()
+    if not key:
+        sys.exit(f"No HydraDB key yet. Save it privately in {HYDRA_KEY_FILE} (on the box: bash ~/todo/05-hydradb-key.sh)")
+    return HydraDB(token=key)
+
+
+def hydra_fail(step, e):
+    sys.exit(f"HydraDB {step} failed: {type(e).__name__}: {str(e)[:400]}")
+
+
+def hydra_state():
+    try:
+        return json.loads(HYDRA_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"database": None, "docs": {}}
+
+
+def hydra_wait(client, database, collection, ids, timeout=300):
+    """Wait until HydraDB has indexed these documents (they can't be searched before).
+    'graph_creation' counts as done: the text is searchable; HydraDB builds the graph in the background."""
+    start, pending = time.time(), list(ids)
+    while pending and time.time() - start < timeout:
+        try:
+            items = client.context.status(database=database, collection=collection, ids=pending).data.statuses or []
+        except Exception as e:
+            hydra_fail("status check", e)
+        failed = [f"{x.id}: {x.error_message or x.message or x.indexing_status}" for x in items
+                  if x.indexing_status in ("failed", "errored")]
+        if failed:
+            sys.exit("HydraDB could not index: " + "; ".join(failed))
+        if items:
+            pending = [x.id for x in items if x.indexing_status not in ("completed", "graph_creation")]
+        if pending:
+            time.sleep(5)
+    if pending:
+        sys.exit(f"HydraDB is still indexing {len(pending)} document(s) after {timeout} s. Run the command again later.")
+
+
+def hydra_push():
+    """Copy every screened document to HydraDB: one collection per folder, an ACL from roles.conf on each."""
+    _, roles = load_config()
+    shelf = SHELVES / BEFORE_BRAIN / "knowledge"            # the 'before' brain holds every loaded document
+    files = sorted(shelf.rglob("*.md")) if shelf.exists() else []
+    if not files:
+        sys.exit("No documents loaded yet. First: nk.py ingest-dir <dataset>")
+    client, database = hydra_client(), hydra_database()
+    from hydra_db.errors import ConflictError
+    try:
+        client.databases.create(database=database)
+    except ConflictError:
+        pass                                                  # it already exists: reuse it
+    except Exception as e:
+        hydra_fail("database create", e)
+    start = time.time()
+    while True:
+        try:
+            if client.databases.status(database=database).data.infra.ready_for_ingestion:
+                break
+        except Exception as e:
+            hydra_fail("database status", e)
+        if time.time() - start > 180:
+            sys.exit("HydraDB is still preparing the database. Run the command again in a minute.")
+        print("Waiting for HydraDB to prepare the database...", flush=True)
+        time.sleep(5)
+
+    old = hydra_state()
+    old_docs = old.get("docs", {}) if old.get("database") == database else {}
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    wanted, by_collection, held = {}, {}, []
+    for path in files:
+        rel = str(path.relative_to(shelf))
+        folder = rel.split("/", 1)[0].lower()
+        readers = sorted(r for r, folders in roles.items() if folder in folders)
+        if not readers:
+            continue                                          # no role may read it: never uploaded
+        text = path.read_text(encoding="utf-8")
+        if screen(text):
+            held.append(rel)                                  # screened again: instruction-like text never leaves
+            continue
+        acl = [hydra_principal(r) for r in readers]
+        if not acl:                                           # HydraDB would make a document without an ACL public
+            sys.exit(f"Refusing to upload {rel} without an ACL")
+        doc_id, col = hydra_id(rel), hydra_collection(folder)
+        wanted[doc_id] = {"path": rel, "collection": col, "acl": acl}
+        by_collection.setdefault(col, []).append({
+            "id": doc_id, "database": database, "collection": col,
+            "title": rel,                                     # comes back as source_title, so answers can cite the file
+            "type": "internal_notes", "kind": "knowledge_base", "provider": "needtoknow",
+            "external_id": rel, "timestamp": stamp,
+            "fields": {"kind": "knowledge_base", "title": rel, "body": text,
+                       "created_by": "needtoknow", "created_at": stamp},
+            "metadata": {"folder": folder},
+            "acl": acl,
+        })
+
+    for col, items in sorted(by_collection.items()):           # upload everything first...
+        try:
+            res = client.context.ingest(database=database, collection=col, type="knowledge",
+                                        app_knowledge=json.dumps(items), upsert="true")
+        except Exception as e:
+            hydra_fail(f"upload to collection {col}", e)
+        errors = [f"{x.id}: {x.error}" for x in ((res.data.results if res.data else None) or []) if x.error]
+        if errors:
+            sys.exit("HydraDB rejected: " + "; ".join(errors))
+        for it in items:
+            print(f"PUSHED   {it['title']:<42} -> collection {col:<13} acl: "
+                  + ", ".join(a.rsplit(":", 1)[-1] for a in it["acl"]), flush=True)
+    print("Waiting for HydraDB to index them...", flush=True)
+    for col, items in sorted(by_collection.items()):           # ...then wait once: HydraDB indexes in parallel
+        hydra_wait(client, database, col, [it["id"] for it in items])
+
+    # Access changed in roles.conf? Replace those ACLs (the complete new list).
+    changed = [i for i, d in wanted.items() if i in old_docs and old_docs[i]["acl"] != d["acl"]]
+    for doc_id in changed:
+        d = wanted[doc_id]
+        try:
+            client.context.update_source_metadata(doc_id, acl=d["acl"], collection=d["collection"], database=database)
+        except Exception as e:
+            hydra_fail(f"ACL update for {d['path']}", e)
+        print(f"ACL      {d['path']}: now " + ", ".join(a.rsplit(":", 1)[-1] for a in d["acl"]))
+
+    # Uploaded before, but no role may read it now (or the file is gone)? Remove it.
+    stale = {i: d for i, d in old_docs.items() if i not in wanted}
+    for col in sorted({d["collection"] for d in stale.values()}):
+        ids = [i for i, d in stale.items() if d["collection"] == col]
+        try:   # "strict": otherwise HydraDB answers OK even when nothing was deleted
+            res = client.context.delete(hydra_db_delete_status="strict", database=database, collection=col,
+                                        ids=ids, type="knowledge")
+        except Exception as e:
+            hydra_fail(f"removing {len(ids)} old document(s)", e)
+        gone = getattr(res.data, "deleted_count", None) if res.data else None
+        if gone is not None and gone < len(ids):
+            sys.exit(f"HydraDB removed only {gone} of {len(ids)} old document(s) from {col}. Check, then run again.")
+        for i in ids:
+            print(f"REMOVED  {stale[i]['path']} (no role may read it now, or it was deleted)")
+
+    HYDRA_STATE.write_text(json.dumps({"database": database, "docs": wanted}, indent=1), encoding="utf-8")
+    os.chmod(HYDRA_STATE, 0o600)
+    audit("hydra-push", database=database, pushed=len(wanted), collections=sorted(by_collection),
+          acl_updated=len(changed), removed=len(stale), held=held)
+    print(f"\nDone: {len(wanted)} document(s) in HydraDB database '{database}', {len(by_collection)} collection(s). "
+          "Every document carries an ACL from roles.conf.")
+    if held:
+        print(f"HELD     {len(held)} file(s) with instruction-like text were not uploaded: {', '.join(held)}")
+
+
+def hydra_query(client, database, roles, role, text, query_by="text", max_results=10, titles=None,
+                extra=None, return_raw=False):
+    """Search HydraDB as one role. nk's only way to query HydraDB, so all three locks always apply.
+    Returns (results kept, titles of results nk had to drop because they came from another role's folder)."""
+    pushed = {d["collection"] for d in hydra_state().get("docs", {}).values()}
+    allowed = sorted({hydra_collection(f) for f in roles[role]} & pushed)      # lock 2: only its own collections
+    acl = [hydra_principal(role)]                                               # lock 1: always say who is asking
+    if not acl or acl == ["*"]:
+        sys.exit("Refusing to query HydraDB without an ACL: it would return every document.")
+    if not allowed:
+        return [], []
+    args = dict(database=database, query=text, collections=allowed, acl=acl, query_by=query_by,
+                mode="fast", max_results=max_results)
+    if query_by == "text":
+        args["operator"] = "and"
+    if titles:
+        args["titles"] = titles                                                 # narrows; never widens past the ACL
+    for key, value in (extra or {}).items():
+        if key in ("graph_context", "mode"):                                    # never acl, collections or database
+            args[key] = value
+    try:
+        res = client.query(**args)
+    except Exception as e:
+        hydra_fail("query", e)
+    kept, dropped = [], []
+    for c in (res.data.chunks if res.data else None) or []:                   # lock 3: re-check every result
+        folder = (c.source_title or "").split("/", 1)[0].lower()
+        (kept if folder in roles[role] else dropped).append(c)
+    if return_raw:
+        return kept, [c.source_title for c in dropped], res.data
+    return kept, [c.source_title for c in dropped]
+
+
+def hydra_plain(obj):
+    """A HydraDB response -> plain Python, so we can scan EVERYTHING it returned (graph, relations, extras)."""
+    if hasattr(obj, "model_dump"):
+        return hydra_plain(obj.model_dump())
+    if isinstance(obj, dict):
+        return {str(k): hydra_plain(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [hydra_plain(v) for v in obj]
+    if hasattr(obj, "__dict__"):
+        return hydra_plain(vars(obj))
+    return obj
+
+
+def restricted_facts(source, words, role):
+    """The answer's key words that are in its own document but in NONE of this role's documents:
+    if one shows up in what HydraDB returns to this role, it can only have come from a document it may not read."""
+    shelf = SHELVES / role / "knowledge"
+    mine = "\n".join(p.read_text(encoding="utf-8") for p in shelf.rglob("*.md")) if shelf.exists() else ""
+    src = SHELVES / BEFORE_BRAIN / "knowledge" / source
+    src_text = src.read_text(encoding="utf-8") if src.exists() else ""
+    return [alt for spec in words for alt in (a.strip() for a in spec.split("/"))
+            if alt and phrase_found(alt, src_text) and not phrase_found(alt, mine)]
+
+
+def hydra_known_role(roles, role):
+    if role not in roles:
+        sys.exit(f"Unknown role '{role}'. Use one of: {', '.join(roles)}")
+    if not hydra_state().get("docs"):
+        sys.exit("Nothing in HydraDB yet. First: nk.py hydra-push")
+
+
+def hydra_search(role, words):
+    _, roles = load_config()
+    hydra_known_role(roles, role)
+    kept, dropped = hydra_query(hydra_client(), hydra_database(), roles, role, words)
+    files = list(dict.fromkeys(c.source_title for c in kept))
+    restricted = not files and restricted_topic(role, roles, words)
+    audit("hydra-search", role=role, query=words, hits=len(files), dropped=dropped, restricted=restricted)
+    print(f"{role}: {len(files)} file(s) match {words!r}  (HydraDB: {role}'s ACL and collections only)")
+    for f in files:
+        print(f"    {f}")
+    if dropped:
+        print(f"WARNING  HydraDB returned {len(dropped)} result(s) from folders {role} may not read; nk dropped them: "
+              + ", ".join(dropped))
+    check_probing(role)
+
+
+def hydra_check():
+    """No-AI proof on HydraDB: ask every everyday question as every role; expectations come from roles.conf."""
+    _, roles = load_config()
+    questions = load_questions()
+    if not hydra_state().get("docs"):
+        sys.exit("Nothing in HydraDB yet. First: nk.py hydra-push")
+    client, database, targets = hydra_client(), hydra_database(), list(roles)
+    rows, queries, held, found, should_find, blocked, should_block = [], 0, 0, 0, 0, 0, 0
+    graph_tested, graph_untestable, graph_never, graph_leaks = 0, 0, 0, []
+    hidden_titles = {d["path"] for d in hydra_state().get("docs", {}).values()}
+    for q, source, words in questions:
+        folder, cells = source.split("/", 1)[0].lower(), []
+        for role in targets:
+            kept, dropped = hydra_query(client, database, roles, role, q, query_by="hybrid")
+            queries += 1
+            held += not dropped                               # HydraDB returned nothing from another role's folders
+            titles = {c.source_title for c in kept}
+            if folder in roles[role]:
+                should_find += 1
+                found += source in titles
+                cells.append(("✅" if source in titles else "❌") + "A")
+            else:
+                should_block += 1
+                ok = source not in titles and not dropped
+                # graph pass: the knowledge graph fully on (thinking mode), then scan everything HydraDB returned
+                facts = restricted_facts(source, words, role)
+                others = sorted(t for t in hidden_titles if t.split("/", 1)[0].lower() not in roles[role])
+                if facts:
+                    _, more_dropped, data = hydra_query(client, database, roles, role, q, query_by="hybrid",
+                                                        extra={"graph_context": True, "mode": "thinking"},
+                                                        return_raw=True)
+                    queries += 1
+                    held += not more_dropped
+                    text = json.dumps(hydra_plain(data), default=str, ensure_ascii=False)
+                    leaked = [f for f in facts if phrase_found(f, text)] + [t for t in others if t.lower() in text.lower()]
+                    graph_tested += 1
+                    if leaked or more_dropped:
+                        graph_leaks.append((q, role, leaked + more_dropped))
+                        ok = False
+                elif not (SHELVES / BEFORE_BRAIN / "knowledge" / source).exists():
+                    graph_never += 1                  # in no role's folders, so never uploaded: nothing to leak
+                else:
+                    graph_untestable += 1
+                blocked += ok
+                cells.append(("✅" if ok else "❌") + "N")
+        rows.append((q, cells))
+    lines = ["# HydraDB check (no AI)", "",
+             f"- Nothing returned from another role's folders: **{held}/{queries}** queries",
+             f"- Kept away from roles that may not read it: **{blocked}/{should_block}**",
+             f"- Right file found when the role may read it: **{found}/{should_find}**",
+             f"- Knowledge graph fully on (thinking mode), restricted answers or hidden document names anywhere in "
+             f"HydraDB's response: **{len(graph_leaks)}/{graph_tested}** cases" + (" ✅ none" if not graph_leaks else " ❌")
+             + "".join(f" · {n} {why}" for n, why in (
+                 (graph_untestable, "not testable (the answer's words are also in that role's own documents)"),
+                 (graph_never, "with nothing to leak (the answer's document is in no role's folders, so it was never uploaded)"))
+                 if n), "",
+             "A = may read the answer's folder · N = may not · ✅ right · ❌ wrong", "",
+             "| Question | " + " | ".join(targets) + " |", "|---|" + "---|" * len(targets)]
+    lines += [f"| {q} | " + " | ".join(cells) + " |" for q, cells in rows]
+    if graph_leaks:
+        lines += ["", "## Found in the graph context", "", "| Question | Role | What showed up |", "|---|---|---|"]
+        lines += [f"| {q} | {r} | {', '.join(x)} |" for q, r, x in graph_leaks]
+    report = "\n".join(lines) + "\n"
+    REPORTS.mkdir(parents=True, exist_ok=True)
+    out = REPORTS / f"hydra-check-{datetime.datetime.now():%Y%m%d-%H%M}.md"
+    out.write_text(report, encoding="utf-8")
+    audit("hydra-check", queries=queries, held=held, found=found, should_find=should_find,
+          blocked=blocked, should_block=should_block, graph_tested=graph_tested, graph_leaks=len(graph_leaks),
+          report=str(out))
+    print(report + f"\nSaved: {out}")
+
+
+def hydra_ask(role, question):
+    """Answer from excerpts HydraDB returns for this role's ACL. Nothing retrieved = fixed reply, no AI call."""
+    _, roles = load_config()
+    hydra_known_role(roles, role)
+    client, database = hydra_client(), hydra_database()
+    kept, dropped = hydra_query(client, database, roles, role, question, query_by="hybrid", max_results=6,
+                                extra={"mode": HYDRA_ASK_MODE})
+    sources = list(dict.fromkeys(c.source_title for c in kept))
+    if not kept:
+        answer, why, outcome, model, tries = NOT_AVAILABLE.format(role=role), "not available", "refused", "-", 0
+    else:
+        company = load_company()
+        excerpts = "\n\n".join(f"[{c.source_title}]\n{(c.chunk_content or '').strip()[:1500]}" for c in kept)
+        values, _ = hydra_query(client, database, roles, role, "company values", query_by="hybrid",
+                                max_results=4, titles=[VALUES_DOC])
+        values_text = "\n".join((c.chunk_content or "").strip() for c in values)[:2000]
+        by_team = {}
+        for t, topics in load_owners().values():
+            by_team.setdefault(t, []).append(topics)
+        teams = "; ".join(f"{t} ({', '.join(x for x in topics if x)})" for t, topics in by_team.items())
+        prompt = (f"You answer for the {role} role at {company}. This role may read these folders: "
+                  f"{', '.join(sorted(roles[role]))}. Anything outside them isn't yours to answer.\n\n"
+                  + (f"<company-values>\n{values_text}\n</company-values>\n"
+                     "Keep your answer in line with these values.\n\n" if values_text else "")
+                  + "Answer the question using ONLY the excerpts below. They come from your own documents, "
+                  "retrieved from HydraDB for your role. Name the file you used, like (from: folder/file.md). "
+                  "If the excerpts don't answer it, say it isn't in your documents and name the team to ask, "
+                  f"from this list: {teams}.\n\n"
+                  f"<excerpts>\n{excerpts}\n</excerpts>\n\nQuestion: {question}")
+        ok, raw, model, tries = run_agent(role, prompt, "hydra")
+        answer, why = guard(role, raw) if ok else (raw, None)
+        outcome = ("error" if not ok else "off-topic" if why in ("no source", "declined")
+                   else "refused" if why == "not available" or says_not_available(answer) else "answered")
+    audit("hydra-ask", role=role, question=question, outcome=outcome, model=model, tries=tries,
+          sources=sources, dropped=dropped, answer=answer[:300])
+    print(answer)
+    team = owning_team(answer, role, roles) if outcome == "refused" else None
+    print(f"\n[logged: role={role}, outcome={outcome}, model={model}; HydraDB excerpts from: "
+          + (", ".join(sources) if sources else "none (no AI call)") + "]")
+    if team:
+        offer_handoff(role, question, team)
+    check_probing(role)
+
+
+AUDIT_STRANGER = "group:needtoknow:_stranger_no_role"   # a valid identity that no document's access list includes
+
+
+def hydra_candidate_collections():
+    """Every collection worth auditing: one per folder named anywhere in roles.conf (so an unused folder like
+    'finance' is still swept), plus any collection nk has uploaded to. HydraDB lists per collection."""
+    _, roles = load_config()
+    folders = set().union(*roles.values()) | set(load_owners().keys())
+    cols = {hydra_collection(f) for f in folders if f}
+    cols |= {d["collection"] for d in hydra_state().get("docs", {}).values()}
+    return sorted(cols)
+
+
+def hydra_list_all(client, database):
+    """Every knowledge document HydraDB stores (title -> collection). HydraDB lists per collection,
+    so we sweep each candidate collection; listing is not ACL-filtered, which is what an audit needs."""
+    docs = {}
+    for col in hydra_candidate_collections():
+        page = 1
+        while True:
+            try:
+                resp = client.context.list(database=database, collection=col, type="knowledge",
+                                            page=page, page_size=100, include_fields=["title"])
+            except Exception as e:
+                hydra_fail(f"listing collection {col}", e)
+            items = (resp.data.sources if resp.data else None) or []
+            for it in items:
+                if it.title:
+                    docs[it.title] = it.collection or col
+            if len(items) < 100:
+                break
+            page += 1
+    return docs
+
+
+def hydra_reaches(client, database, title, collection, principal):
+    """True if this identity can open this exact document in HydraDB (search limited to its title, access list applied)."""
+    try:
+        r = client.query(database=database, query=title, titles=[title], collections=[collection],
+                          acl=[principal], query_by="hybrid", mode="fast", max_results=5)
+    except Exception as e:
+        hydra_fail("audit probe", e)
+    return title in {c.source_title for c in (r.data.chunks if r.data else None) or []}
+
+
+def hydra_audit():
+    """Check what HydraDB allows, document by document, against roles.conf. No AI."""
+    _, roles = load_config()
+    state = hydra_state()
+    if not state.get("docs"):
+        sys.exit("Nothing in HydraDB yet. First: nk.py hydra-push")
+    client, database = hydra_client(), hydra_database()
+    uploaded = state["docs"]                                   # what nk put there: {id: {path, collection, acl}}
+    by_title = {d["path"]: d for d in uploaded.values()}
+    stored = hydra_list_all(client, database)                 # what HydraDB holds now
+    print(f"Auditing {len(stored)} document(s) in HydraDB as {len(roles)} role(s) and as a stranger "
+          "(no AI; this makes many search calls)...", flush=True)
+    rows, critical, shadow_n, avail_n = [], [], 0, 0
+    for title in sorted(stored):
+        collection = stored[title]
+        folder = title.split("/", 1)[0].lower()
+        should = {r for r in roles if folder in roles[r]}     # who roles.conf says may read it
+        reach = {r for r in roles if hydra_reaches(client, database, title, collection, hydra_principal(r))}
+        stranger = hydra_reaches(client, database, title, collection, AUDIT_STRANGER)
+        shadow = title not in by_title                        # HydraDB has it, but nk never uploaded it
+        over = reach - should                                 # a role that should NOT reach it, but can
+        missing = should - reach                              # a role that should reach it, but can't
+        bad = stranger or over or shadow
+        mark = "CRITICAL" if (stranger or over) else ("SHADOW" if shadow else ("note" if missing else "ok"))
+        if stranger or over:
+            critical.append(title)
+        shadow_n += shadow
+        avail_n += bool(missing)
+        flags = []
+        if stranger:
+            flags.append("readable by ANYONE (no/empty ACL)")
+        if over:
+            flags.append("reachable by " + ", ".join(sorted(over)) + " (not allowed)")
+        if shadow:
+            flags.append("not uploaded by nk")
+        if missing:
+            flags.append("NOT reachable by " + ", ".join(sorted(missing)) + " (should be)")
+        rows.append((mark, title, ", ".join(sorted(reach)) or "nobody", flags))
+    lines = ["# HydraDB access audit (no AI)", "",
+             f"- Documents stored: **{len(stored)}**",
+             f"- Readable by a stranger, or by a role that shouldn't: **{len(critical)}**"
+             + (" ✅ none" if not critical else " ❌"),
+             f"- Stored but not uploaded by nk (shadow): **{shadow_n}**",
+             f"- A permitted role can't reach it (availability, not a leak): **{avail_n}**", "",
+             "| | Document | Reachable by | Notes |", "|---|---|---|---|"]
+    for mark, title, reach, flags in rows:
+        icon = {"CRITICAL": "🔴", "SHADOW": "🟠", "note": "🟡", "ok": "🟢"}[mark]
+        lines.append(f"| {icon} | {title} | {reach} | {'; '.join(flags) or 'matches roles.conf'} |")
+    report = "\n".join(lines) + "\n"
+    REPORTS.mkdir(parents=True, exist_ok=True)
+    out = REPORTS / f"hydra-audit-{datetime.datetime.now():%Y%m%d-%H%M}.md"
+    out.write_text(report, encoding="utf-8")
+    audit("hydra-audit", stored=len(stored), critical=critical, shadow=shadow_n, unreachable=avail_n, report=str(out))
+    print("\n" + report + f"\nSaved: {out}")
+    if critical:
+        print(f"\n🔴 {len(critical)} document(s) readable by the wrong people. See the table above.")
+    else:
+        print("\n🟢 Every document is reachable only by the roles roles.conf allows, and by no stranger.")
+
+
+def hydra_reset(confirm):
+    if confirm != "--yes":
+        sys.exit("This deletes the HydraDB database (your files and shelves are untouched).\n"
+                 "Re-run as: nk.py hydra-reset --yes")
+    client, database = hydra_client(), hydra_database()
+    try:
+        client.databases.delete(database=database)
+    except Exception as e:
+        hydra_fail("database delete", e)
+    HYDRA_STATE.unlink(missing_ok=True)
+    audit("hydra-reset", database=database)
+    print(f"Deleted HydraDB database '{database}'. Upload again with: nk.py hydra-push")
 
 
 def main():
@@ -1004,10 +1920,30 @@ def main():
         search(rest[0], " ".join(rest[1:]))
     elif cmd == "who" and not rest:
         who()
+    elif cmd == "handoffs" and not rest:
+        show_handoffs()
+    elif cmd == "alerts" and not rest:
+        show_alerts()
+    elif cmd == "log" and rest[:1] == ["--verify"] and len(rest) <= 2:
+        verify_log(rest[1] if len(rest) == 2 else None)
+    elif cmd == "log" and rest == ["--tamper-test"]:
+        tamper_test()
     elif cmd == "log" and len(rest) <= 1:
         show_log(int(rest[0]) if rest else 20)
     elif cmd == "reset" and len(rest) <= 1:
         reset(rest[0] if rest else "")
+    elif cmd == "hydra-push" and not rest:
+        hydra_push()
+    elif cmd == "hydra-search" and len(rest) >= 2:
+        hydra_search(rest[0], " ".join(rest[1:]))
+    elif cmd == "hydra-check" and not rest:
+        hydra_check()
+    elif cmd == "hydra-audit" and not rest:
+        hydra_audit()
+    elif cmd == "hydra-ask" and len(rest) >= 2:
+        hydra_ask(rest[0], " ".join(rest[1:]))
+    elif cmd == "hydra-reset" and len(rest) <= 1:
+        hydra_reset(rest[0] if rest else "")
     else:
         print(__doc__)
         sys.exit(1)
