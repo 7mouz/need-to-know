@@ -1,0 +1,45 @@
+[
+  {
+    "type": "message",
+    "user": "U07GRACE",
+    "text": "<@U07GRACE> has joined the channel",
+    "ts": "1789401600.000001",
+    "subtype": "channel_join"
+  },
+  {
+    "type": "message",
+    "user": "U07GRACE",
+    "text": "Morning all! Reminder: all-hands is Thursday at 10:00, in the big room and on video. Notes go in the handbook afterwards.",
+    "ts": "1789401720.000002"
+  },
+  {
+    "type": "message",
+    "user": "U06TOM",
+    "text": "PixelConnect (our VPN) gets an update tonight. Nothing to do: it updates itself. If it asks you to sign in again, use your normal company login.",
+    "ts": "1789402200.000003"
+  },
+  {
+    "type": "message",
+    "user": "U01DANA",
+    "text": "Thanks <@U06TOM>! Also: the customer webinar on boards &amp; templates is Sept 24. Sign-ups: <https://events.pixelheaven.example/boards|webinar page>",
+    "ts": "1789403100.000004"
+  },
+  {
+    "type": "message",
+    "user": "U07GRACE",
+    "text": "Office note: the kitchen gets a deep clean Friday afternoon, so please take your things home Thursday.",
+    "ts": "1789404000.000005"
+  },
+  {
+    "type": "message",
+    "user": "U05PRIYA",
+    "text": "Benefits Q&amp;A session next week. Details soon in <#C01GEN|general>.",
+    "ts": "1789405500.000006"
+  },
+  {
+    "type": "message",
+    "user": "U02SAM",
+    "text": "Support is at full strength again this week. Shout-out to <@U03LENA> for clearing the sign-in queue :tada:",
+    "ts": "1789407600.000007"
+  }
+]

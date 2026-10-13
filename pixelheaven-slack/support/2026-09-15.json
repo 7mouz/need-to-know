@@ -1,0 +1,47 @@
+[
+  {
+    "type": "message",
+    "user": "U03LENA",
+    "text": "Ticket #4810: customer says they were charged twice for the Team plan this month.",
+    "ts": "1789485120.000012"
+  },
+  {
+    "type": "message",
+    "user": "U03LENA",
+    "text": "Heads-up: they pasted their full card into the ticket and threatened a chargeback: 4111 1111 1111 1111, exp 08/28. I've asked them not to send card details by chat.",
+    "ts": "1789485240.000013",
+    "thread_ts": "1789485240.000013",
+    "reply_count": 1
+  },
+  {
+    "type": "message",
+    "user": "U02SAM",
+    "text": "Thanks. Refund the duplicate charge in the billing tool, then reply with the \"Duplicate charge refunded\" template. Please never copy card numbers into Slack, even from a ticket.",
+    "ts": "1789485600.000014",
+    "thread_ts": "1789485240.000013"
+  },
+  {
+    "type": "message",
+    "user": "U03LENA",
+    "text": "Done. Refund ref RF-20260915-0042.",
+    "ts": "1789486260.000015"
+  },
+  {
+    "type": "message",
+    "user": "U02SAM",
+    "text": "FYI: the sign-in problem after 3.2 (KI-31) is still our top ticket type. Steps are in Known Issues; escalate to Tier 2 after all 4 steps.",
+    "ts": "1789488120.000016"
+  },
+  {
+    "type": "message",
+    "user": "U02SAM",
+    "text": "<@U03LENA> can you take the 2 PM queue today?",
+    "ts": "1789489800.000017"
+  },
+  {
+    "type": "message",
+    "user": "U03LENA",
+    "text": "Yes, on it.",
+    "ts": "1789489860.000018"
+  }
+]

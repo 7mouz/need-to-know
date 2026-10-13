@@ -1,0 +1,62 @@
+[
+  {
+    "id": "C01GEN",
+    "name": "general",
+    "created": 1700000000,
+    "members": [
+      "U01DANA",
+      "U02SAM",
+      "U03LENA",
+      "U04MARCO",
+      "U05PRIYA",
+      "U06TOM",
+      "U07GRACE",
+      "U08NEWS"
+    ]
+  },
+  {
+    "id": "C02SUP",
+    "name": "support",
+    "created": 1700000000,
+    "members": [
+      "U01DANA",
+      "U02SAM",
+      "U03LENA",
+      "U04MARCO",
+      "U05PRIYA",
+      "U06TOM",
+      "U07GRACE",
+      "U08NEWS"
+    ]
+  },
+  {
+    "id": "C03ENG",
+    "name": "eng",
+    "created": 1700000000,
+    "members": [
+      "U01DANA",
+      "U02SAM",
+      "U03LENA",
+      "U04MARCO",
+      "U05PRIYA",
+      "U06TOM",
+      "U07GRACE",
+      "U08NEWS"
+    ]
+  },
+  {
+    "id": "C05RND",
+    "name": "random",
+    "created": 1700000000,
+    "members": [
+      "U01DANA",
+      "U02SAM",
+      "U03LENA",
+      "U04MARCO",
+      "U05PRIYA",
+      "U06TOM",
+      "U07GRACE",
+      "U08NEWS"
+    ]
+  }
+]

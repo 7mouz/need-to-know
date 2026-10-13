@@ -1,0 +1,38 @@
+[
+  {
+    "type": "message",
+    "user": "U05PRIYA",
+    "text": "New Support Specialist starts Oct 5: Jordan Kim. Laptop request is in with IT.",
+    "ts": "1789664400.000028"
+  },
+  {
+    "type": "message",
+    "user": "U05PRIYA",
+    "text": "Home address for the offer letter: 2217 Alder Lane, San Jose, CA 95125.",
+    "ts": "1789664640.000029"
+  },
+  {
+    "type": "message",
+    "user": "U05PRIYA",
+    "text": "And the SSN for the I-9: 123-45-6789. I'll move both into the HR system and delete them here.",
+    "ts": "1789664760.000030"
+  },
+  {
+    "type": "message",
+    "user": "U07GRACE",
+    "text": "Thanks Priya. Reminder for everyone: personal details belong in the HR system, not Slack.",
+    "ts": "1789666200.000031"
+  },
+  {
+    "type": "message",
+    "user": "U05PRIYA",
+    "text": "The interview loop for the Tier 2 role is full next week.",
+    "ts": "1789667100.000032"
+  },
+  {
+    "type": "message",
+    "user": "U05PRIYA",
+    "text": "Open enrollment for benefits starts Nov 1.",
+    "ts": "1789668000.000033"
+  }
+]

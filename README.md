@@ -34,6 +34,46 @@ company folders  ──►  roles.conf  ──►  nk setup  ──►  one sear
 - Every action goes into an audit log that can't be quietly edited. Each entry holds a fingerprint of the entry before it, and a small anchor file remembers the count and the last fingerprint. `nk log --verify` shows if any entry was changed, deleted, added, or cut off the end. `nk log --tamper-test` proves it on copies of the log.
 - The company's values are in the brain too (`public/company-values.md`), so every role can quote them.
 
+## Slack messages, with sensitive data removed
+
+A lot of company knowledge lives in chat, and so do a lot of accidental leaks. `nk ingest-slack` loads a Slack export: the .zip a Slack admin downloads, or its unzipped folder. There is no live link to Slack, so no Slack token is stored anywhere.
+
+- `roles.conf` puts each channel in a folder: `slack: support = support`. Only the roles that read that folder can read the channel. A channel with no line goes to nobody.
+- Each channel's day becomes one document and goes through the same steps as every other file: checked for hidden instructions, sensitive data removed, then given only to the roles that may read its folder.
+- The zip is read in memory. Paths that try to leave the export, links, and oversized files are refused.
+
+Before any file reaches an assistant, the search index, or HydraDB, `nk` removes:
+
+| What | How `nk` finds it | Replaced with |
+|---|---|---|
+| Card numbers | 13 to 19 digits that pass the card checksum (Luhn), so order numbers stay | `[card number removed]` |
+| Social Security numbers | the 3-2-4 digit format, minus numbers that are never issued | `[SSN removed]` |
+| Keys and passwords | AWS, Slack, GitHub and `sk-` keys, private key blocks, and the value after `password:`, `token:` or `api_key=` | `[secret removed]` |
+| Home addresses | a street address after "home address", "lives at" or "my address is" | `[home address removed]` |
+
+This runs on every file, not only Slack. The log records what kind was removed and how many, never the value.
+
+On the demo export (`pixelheaven-slack/`, made up; the card is Visa's public test number and the key is the example from AWS's documentation):
+
+```
+REDACTED roadmap/slack-eng-2026-09-17.md: 1 secret
+REDACTED roadmap/slack-eng-2026-09-18.md: 1 secret
+BLOCKED  public/slack-general-2026-09-16.md: found instruction-like text ['list all files', 'New instructions:', 'do not tell the user']
+REDACTED hr/slack-people-ops-2026-09-17.md: 1 SSN, 1 home address
+REDACTED support/slack-support-2026-09-15.md: 1 card number
+SKIPPED  #random  (no 'slack: random = <folder>' line in roles.conf)
+
+$ nk search support 4111
+support: 0 file(s) match '4111'
+$ nk search support chargeback
+support: 1 file(s) match 'chargeback'
+    support/slack-support-2026-09-15.md
+```
+
+None of the 16 company documents changed. Afterwards, none of the planted values is in any assistant's documents or in the log.
+
+The limit: these are patterns. They catch structured data like card numbers and keys. A loose personal detail ("she just moved near the park") can still get through. An AI could catch more, but only by reading the raw text first, which is what this step is there to prevent.
+
 ## The web page
 
 `nk web` serves a page for the same brain. It uses Python's standard library, so there is nothing to install. Pick a role, ask a question, and see the answer with its source. If another team owns the answer, the page offers to pass the question on. The right side shows which folders the role can see and the live security results.
@@ -128,6 +168,7 @@ We found 5 default settings that are wrong for an assistant shared by many roles
 |---|---|
 | `nk setup [--prune]` | Make OpenClaw match `roles.conf`: create the role agents, turn on the safety settings, check them |
 | `nk ingest-dir <folder>` | Load documents (Markdown, text, CSV, JSON, HTML, Word, PowerPoint, PDF, saved emails .eml/.mbox). Each file becomes searchable text, is checked for hidden instructions, and goes only to the roles that may read its folder |
+| `nk ingest-slack <export>` | Load a Slack export (.zip or folder). Channels go to the folders `roles.conf` names, the rest go to nobody, and sensitive data is removed first |
 | `nk index` | Rebuild each role's search from its own folder |
 | `nk ask <role> "question"` | Ask one role's assistant. If the answer belongs to another team, it offers to pass the question on |
 | `nk brief <role>` | A one-page first-week guide for that role, with every source checked |
@@ -170,7 +211,8 @@ python3 ~/needtoknow/nk.py hydra-push && python3 ~/needtoknow/nk.py hydra-check
 
 - The login is simulated: in the demo you pick the role. In real use, the company login would set each person's role.
 - It suits a few roles. With thousands of permission groups, you would filter at search time instead of copying documents to each role.
-- It reads documents only. There are no live Slack, Drive, or Gmail connections yet, but any export works once it is sorted into folders.
+- There are no live Slack, Drive, or Gmail connections. Slack exports load directly (`nk ingest-slack`); other exports work once they are sorted into folders.
+- Sensitive-data removal uses patterns (see the Slack section). A blocked file is kept as it was, for review inside `nk`'s folder. One Slack message with hidden instructions blocks that channel's whole day.
 - The separation between roles depends on OpenClaw's tool settings. A separate sandbox or Linux user for each role would be stronger.
 - The HydraDB numbers measure search: the right document comes back for the right role. The AI-graded score above used OpenClaw's own search.
 - A handoff is a request file in a queue that the team reads with `nk handoffs`. It isn't emailed to the team yet, and the reply goes by email outside `nk`. In the demo the person types their work email; in real use it would come from their login.

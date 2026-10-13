@@ -1,0 +1,20 @@
+[
+  {
+    "type": "message",
+    "user": "U06TOM",
+    "text": "Temporary staging database password: Tide-Pool-2026 (expires Friday). Next time ask me in a DM.",
+    "ts": "1789746300.000025"
+  },
+  {
+    "type": "message",
+    "user": "U04MARCO",
+    "text": "Large boards load about 30% faster in the 3.2 build. Numbers are in the release notes draft.",
+    "ts": "1789749000.000026"
+  },
+  {
+    "type": "message",
+    "user": "U01DANA",
+    "text": "Nice work, <@U04MARCO>!",
+    "ts": "1789749900.000027"
+  }
+]

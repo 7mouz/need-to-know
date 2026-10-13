@@ -13,8 +13,13 @@ Commands:
   nk.py ingest-dir <dataset>    Load a dataset: each file goes to every role that may read its top-level folder.
                                 Markdown, text, CSV, JSON, HTML, Word, PowerPoint, PDF (needs pdftotext)
                                 and saved emails (.eml, .mbox)
-                                are turned into searchable text, and every file is screened first
+                                are turned into searchable text, and every file is screened first.
+                                Card numbers, SSNs, keys and passwords, and home addresses marked as personal
+                                are removed before any agent sees a file (the log keeps counts, never values)
   nk.py ingest <file> <folder>  Load one file as if it sat in <folder>
+  nk.py ingest-slack <export>   Load a Slack export (the .zip Slack gives you, or its unzipped folder). Each
+                                channel's day becomes one document in the folder roles.conf gives that channel
+                                ('slack: support = support'); a channel with no such line goes to nobody
   nk.py ask <role> <question>   Ask one role's agent (the role is the simulated login). If the answer belongs to
                                 another team, it offers to pass the question on (only after a yes)
   nk.py brief <role>            Have a role's agent write a first-week brief; saved to briefs/; sources checked
@@ -317,8 +322,8 @@ def load_config():
         if key == "model":
             model = value.strip()
             continue
-        if key in ("ask", "company", "email-domain"):    # read by load_owners() / load_company() / handoffs
-            continue
+        if key in ("ask", "company", "email-domain", "slack"):    # read by load_owners() / load_company() /
+            continue                                              # handoffs / load_slack_map()
         if not ROLE_NAME.match(key) or key == BEFORE_BRAIN:
             sys.exit(f"roles.conf line {n}: bad role name {key!r} "
                      f"(lowercase letters, digits and '-'; '{BEFORE_BRAIN}' is reserved)")
@@ -437,6 +442,64 @@ def screen(text):
         if match:
             hits.append(match.group(0))
     return hits
+
+
+# Sensitive data, removed from every file before any agent, search index or HydraDB gets it.
+# Patterns, no AI: they catch structured data (card numbers, SSNs, keys and passwords, home addresses
+# marked as personal). Free-text personal details ("she just moved near the park") can still get through.
+CARD = re.compile(r"(?<![\d-])\d(?:[ -]?\d){12,18}(?![\d-])")       # 13-19 digits; must also pass the Luhn check
+SSN = re.compile(r"\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b")
+KEYS = [re.compile(p) for p in (
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+    r"\bAKIA[0-9A-Z]{16}\b",                      # AWS access key
+    r"\bxox[abprs]-[A-Za-z0-9-]{10,}",            # Slack token
+    r"\bgh[pousr]_[A-Za-z0-9]{30,}",              # GitHub token
+    r"\bsk-[A-Za-z0-9_-]{20,}")]                  # "sk-" API keys
+LABELED_SECRET = re.compile(r"(?i)\b(password|passwd|pwd|passcode|api[ _-]?key|secret|token)(\s*[:=]\s*)(?!\[)(\S+)")
+HOME_ADDRESS = re.compile(                        # only when the text says it's personal; office addresses stay
+    r"(?i:\b(home address|lives at|my address is|personal address))([^\d\n]{0,40}?)"
+    r"(\d{1,6}\s+(?:[A-Z][\w.'-]*\s+){1,4}(?:St|Street|Ave|Avenue|Rd|Road|Ln|Lane|Dr|Drive|Ct|Court|Way|Blvd|Pl|Place)\b\.?"
+    r"(?:,?\s*(?:Apt|Apartment|Unit|Suite|#)\.?\s*[\w-]+)?"
+    r"(?:,\s*[A-Z][A-Za-z.'-]*(?:\s+[A-Z][A-Za-z.'-]*)*)?(?:,\s*[A-Z]{2})?(?:\s+\d{5}(?:-\d{4})?)?)")
+
+
+def _luhn(digits):
+    total = sum(int(d) for d in digits[-1::-2]) + sum(sum(divmod(2 * int(d), 10)) for d in digits[-2::-2])
+    return total % 10 == 0 and len(set(digits)) > 1
+
+
+def redact(text):
+    """Remove card numbers, SSNs, keys and passwords, and personal home addresses.
+    Returns (text, {kind: how many}). Labels stay ("password: [secret removed]") so the text still reads."""
+    removed = {}
+
+    def sub(pattern, kind, fix, text):
+        def one(m):
+            out = fix(m)
+            if out != m.group(0):
+                removed[kind] = removed.get(kind, 0) + 1
+            return out
+        return pattern.sub(one, text)
+
+    def labeled(m):
+        value = m.group(3)
+        core = value.rstrip(".,;:!?)]}'\"")
+        return m.group(1) + m.group(2) + "[secret removed]" + value[len(core):] if core else m.group(0)
+
+    for key in KEYS:
+        text = sub(key, "secret", lambda m: "[secret removed]", text)
+    text = sub(LABELED_SECRET, "secret", labeled, text)
+    text = sub(CARD, "card number", lambda m: "[card number removed]"
+               if _luhn(re.sub(r"\D", "", m.group(0))) else m.group(0), text)
+    text = sub(SSN, "SSN", lambda m: "[SSN removed]", text)
+    text = sub(HOME_ADDRESS, "home address", lambda m: m.group(1) + m.group(2) + "[home address removed]", text)
+    return text, removed
+
+
+def describe_removed(removed):
+    """{'card number': 2, 'SSN': 1} -> '2 card numbers, 1 SSN'."""
+    return ", ".join(f"{n} {kind}" + ("" if n == 1 else "es" if kind.endswith("ss") else "s")
+                     for kind, n in removed.items())
 
 
 # ---------------------------------------------------------------- commands
@@ -602,15 +665,23 @@ def ingest(path, label, rel=None, roles=None):
         print(f"         Not given to any agent. Copy kept for review in {QUARANTINE}/")
         return False
 
+    # Sensitive data is removed before the file lands on any shelf, so agents, search and HydraDB
+    # (which uploads from the shelves) only ever get the cleaned text. The log keeps counts, never values.
+    text, removed = redact(text)
     is_md = src.suffix.lower() == ".md"
     out_rel = rel if is_md else rel.with_name(rel.name + ".md")      # policy.pdf -> policy.pdf.md
     for role in [*readers, BEFORE_BRAIN]:
         dest = SHELVES / role / "knowledge" / label / out_rel
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if is_md:
+        if is_md and not removed:
             shutil.copy2(src, dest)
+        elif is_md:
+            dest.write_text(text, encoding="utf-8")
         else:
             dest.write_text(f"> Converted by nk from `{rel.name}` ({how}).\n\n{text}\n", encoding="utf-8")
+    if removed:
+        audit("redact", file=f"{label}/{rel}", removed=removed)
+        print(f"REDACTED {label}/{out_rel}: {describe_removed(removed)}")
     audit("ingest", file=f"{label}/{rel}", roles=readers, screened=True, converted=None if is_md else how)
     print(f"ADDED    {label}/{out_rel} -> {', '.join(readers)}" + ("" if is_md else f"   [converted from {how}]"))
     return True
@@ -660,6 +731,196 @@ def ingest_dir(folder):
         print(f"NOTE     dataset folders no role reads (given to nobody): {', '.join(unused)}")
     print(f"\nDone: {processed} file(s) loaded, {refused} blocked or unreadable, {len(skipped)} skipped. "
           "Files not loaded were given to NO agent (deny by default).")
+
+
+# ---------------------------------------------------------------- Slack (export files)
+#
+# nk reads a Slack workspace export (Slack: Workspace settings -> Import/Export data -> Export): a ZIP with
+# users.json, channels.json and one folder per channel holding one JSON file per day. There is no live link to
+# Slack, so no Slack token is stored anywhere. roles.conf says which folder each channel belongs to
+# ("slack: support = support"); a channel with no line goes to nobody. Each channel's day becomes one document
+# that takes the normal path: screened for hidden instructions, sensitive data removed, then copied only to the
+# roles that may read its folder.
+
+SLACK_CHANNEL = re.compile(r"^[a-z0-9][a-z0-9_-]{0,79}$")
+SLACK_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}\.json$")
+SLACK_SKIP = {"channel_join", "channel_leave", "group_join", "group_leave"}     # "X has joined the channel"
+SLACK_MAX_TOTAL = 200 * 2**20                                                  # the whole export, unpacked
+
+
+def load_slack_map():
+    """roles.conf 'slack: <channel> = <folder>' lines -> {channel: folder}."""
+    out = {}
+    for raw in ROLES_FILE.read_text(encoding="utf-8").splitlines():
+        key, _, value = raw.split("#", 1)[0].strip().partition(":")
+        if key.strip().lower() == "slack" and "=" in value:
+            channel, _, folder = value.partition("=")
+            out[channel.strip().lower()] = folder.strip().lower()
+    return out
+
+
+def _slack_files(src):
+    """Read a Slack export into {path inside the export: bytes}. Nothing is unpacked to disk, links are never
+    followed, paths that try to leave the export are refused, and sizes are capped."""
+    files, refused, total = {}, [], 0
+
+    def take(name, size, read):
+        nonlocal total
+        data = read() if size <= MAX_PART_BYTES and total + size <= SLACK_MAX_TOTAL else None
+        if data is None or len(data) > MAX_PART_BYTES or total + len(data) > SLACK_MAX_TOTAL:
+            refused.append(f"{name}  (too big)")
+            return
+        total += len(data)
+        files[name] = data
+
+    if src.is_file():
+        if not zipfile.is_zipfile(src):
+            sys.exit(f"{src} is not a .zip. Give the .zip Slack exported, or its unzipped folder.")
+        with zipfile.ZipFile(src) as z:
+            for info in z.infolist():
+                name = info.filename
+                if info.is_dir() or name.startswith("__MACOSX/"):
+                    continue
+                if name.startswith(("/", "\\")) or "\\" in name or ":" in name or ".." in name.split("/"):
+                    refused.append(f"{name}  (path leaves the export: refused)")
+                    continue
+                try:
+                    with z.open(info) as f:                              # read at most the cap, even if
+                        take(name, info.file_size, lambda: f.read(MAX_PART_BYTES + 1))   # the size is a lie
+                except (zipfile.BadZipFile, OSError, RuntimeError, NotImplementedError):
+                    refused.append(f"{name}  (could not read it)")
+    else:
+        root = src.resolve()
+        for folder, subdirs, names in os.walk(root):                     # os.walk never follows links
+            here = pathlib.Path(folder)
+            for d in subdirs:
+                if (here / d).is_symlink():
+                    refused.append(f"{(here / d).relative_to(root)}/  (link: never followed, for safety)")
+            subdirs[:] = [d for d in subdirs if not d.startswith(".") and not (here / d).is_symlink()]
+            for n in names:
+                p, rel = here / n, (here / n).relative_to(root).as_posix()
+                if n.startswith("."):
+                    continue
+                if p.is_symlink():
+                    refused.append(f"{rel}  (link: never followed, for safety)")
+                    continue
+                take(rel, p.stat().st_size, p.read_bytes)
+    # A zipped folder has everything one level down: use the folder that holds users.json / channels.json.
+    tops = sorted((n.rsplit("/", 1)[0] + "/" if "/" in n else "" for n in files
+                   if n.rsplit("/", 1)[-1] in ("users.json", "channels.json")), key=len)
+    if tops and tops[0]:
+        files = {n[len(tops[0]):]: b for n, b in files.items() if n.startswith(tops[0])}
+    return files, refused
+
+
+def _slack_text(text, users, channels):
+    """Slack's markup -> plain text: <@U1> -> @Name, <#C1|general> -> #general, <https://x|label> -> label."""
+    def link(m):
+        target, _, label = m.group(1).partition("|")
+        if target.startswith("@"):
+            return "@" + users.get(target[1:], label or target[1:])
+        if target.startswith("#"):
+            return "#" + (label or channels.get(target[1:], target[1:]))
+        if target.startswith("!"):
+            return "@" + (label or target[1:].split("^")[0])
+        return label or target
+    text = re.sub(r"<([^<>\n]+)>", link, text)
+    return text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+
+
+def _slack_day(channel, day, messages, users, channels):
+    """One channel's day -> a markdown document, or None if it has no messages worth keeping."""
+    lines = []
+    for m in messages if isinstance(messages, list) else []:
+        if not isinstance(m, dict) or m.get("type") != "message" or m.get("subtype") in SLACK_SKIP:
+            continue
+        who = (users.get(str(m.get("user", ""))) or (m.get("user_profile") or {}).get("real_name")
+               or m.get("username") or "someone")
+        try:
+            when = datetime.datetime.fromtimestamp(float(m.get("ts", 0)), datetime.timezone.utc).strftime("%H:%M")
+        except (TypeError, ValueError, OverflowError, OSError):
+            when = "--:--"
+        text = _slack_text(str(m.get("text", "")), users, channels).strip().replace("\n", "\n    ")
+        files = [str(f.get("name") or f.get("title") or "a file") for f in m.get("files") or [] if isinstance(f, dict)]
+        if files:
+            text += f" (files not loaded: {', '.join(files)})"
+        reply = m.get("thread_ts") not in (None, m.get("ts"))
+        if text:
+            lines.append(f"{'  ' if reply else ''}- **{who}** ({when}{', in a thread' if reply else ''}): {text}")
+    if not lines:
+        return None
+    return f"# Slack #{channel}, {day}\n\n> From a Slack export, loaded by nk. Times are UTC.\n\n" + "\n".join(lines) + "\n"
+
+
+def ingest_slack(export):
+    """Load a Slack export: each channel's day becomes one document in the folder roles.conf gives the channel."""
+    _, roles = load_config()
+    known = set().union(*roles.values())
+    mapping = load_slack_map()
+    src = pathlib.Path(export)
+    if src.is_symlink():
+        sys.exit(f"{src} is a link; links are never followed (safety). Give the real .zip or folder.")
+    if not src.exists():
+        sys.exit(f"No such file or folder: {src}")
+    files, skipped = _slack_files(src)
+
+    def table(name):
+        try:
+            rows = json.loads(files.get(name, b"[]").decode("utf-8", "replace"))
+        except ValueError:
+            return []
+        return [r for r in rows if isinstance(r, dict) and r.get("id")] if isinstance(rows, list) else []
+
+    users = {u["id"]: u.get("real_name") or (u.get("profile") or {}).get("real_name") or u.get("name") or u["id"]
+             for u in table("users.json")}
+    channels = {c["id"]: str(c.get("name", "")) for c in table("channels.json") + table("groups.json")}
+    days = {}
+    for name in sorted(files):
+        parts = name.split("/")
+        if len(parts) == 2 and SLACK_DAY.match(parts[1]):
+            days.setdefault(parts[0], []).append(parts[1])
+    if not days:
+        sys.exit(f"No channel messages found in {src}. Is it a Slack export (one folder per channel)?")
+
+    loaded = blocked = 0
+    with tempfile.TemporaryDirectory(prefix="nk-slack-") as tmp:
+        for channel in sorted(days):
+            folder = mapping.get(channel.lower())
+            if not SLACK_CHANNEL.match(channel):
+                skipped.append(f"#{channel}  (unusual channel name)")
+                continue
+            if folder is None:
+                skipped.append(f"#{channel}  (no 'slack: {channel} = <folder>' line in roles.conf)")
+                continue
+            if folder not in known:
+                skipped.append(f"#{channel}  (roles.conf puts it in '{folder}', a folder no role reads)")
+                continue
+            for day_file in days[channel]:
+                day = day_file[:-len(".json")]
+                try:
+                    messages = json.loads(files[f"{channel}/{day_file}"].decode("utf-8", "replace"))
+                except ValueError:
+                    skipped.append(f"#{channel} {day}  (not valid JSON)")
+                    continue
+                text = _slack_day(channel, day, messages, users, channels)
+                if text is None:
+                    continue
+                path = pathlib.Path(tmp) / f"slack-{channel}-{day}.md"
+                path.write_text(text, encoding="utf-8")
+                if ingest(path, folder, rel=pathlib.Path(path.name), roles=roles):
+                    loaded += 1
+                else:
+                    blocked += 1
+    if skipped:
+        print()
+        for s in skipped:
+            print(f"SKIPPED  {s}")
+        audit("skip", files=skipped)
+    audit("slack-import", export=src.name, loaded=loaded, blocked=blocked, skipped=len(skipped))
+    print(f"\nDone: {loaded} Slack day(s) loaded, {blocked} blocked, {len(skipped)} skipped. "
+          "Channels not in roles.conf were given to NO agent (deny by default).")
+    if loaded:
+        print("Next: nk index   (so search sees the new messages)")
 
 
 def existing_agents():
@@ -1334,6 +1595,11 @@ def show_log(n=20):
             print(f"{ts}  ADDED  {r['file']} -> {', '.join(r['roles'])}{flag}")
         elif ev == "quarantine":
             print(f"{ts}  BLOCK  {r['file']} reason: {r['reason']}")
+        elif ev == "redact":
+            print(f"{ts}  REDACT {r['file']}: {describe_removed(r['removed'])} removed (values never logged)")
+        elif ev == "slack-import":
+            print(f"{ts}  SLACK  {r['loaded']} day(s) loaded, {r['blocked']} blocked, {r['skipped']} skipped"
+                  f" from {r['export']}")
         elif ev == "skip":
             print(f"{ts}  SKIP   {len(r['files'])} file(s) not loaded (no role reads them, or a link)")
         elif ev == "setup":
@@ -2459,6 +2725,8 @@ def main():
         ingest_dir(rest[0])
     elif cmd == "ingest" and len(rest) == 2:
         ingest(*rest)
+    elif cmd == "ingest-slack" and len(rest) == 1:
+        ingest_slack(rest[0])
     elif cmd == "ask" and len(rest) >= 2:
         ask(rest[0], " ".join(rest[1:]))
     elif cmd == "brief" and len(rest) == 1:

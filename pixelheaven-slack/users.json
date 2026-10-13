@@ -1,0 +1,82 @@
+[
+  {
+    "id": "U01DANA",
+    "name": "dana",
+    "real_name": "Dana Reyes",
+    "profile": {
+      "real_name": "Dana Reyes",
+      "title": "Product Manager"
+    },
+    "is_restricted": false
+  },
+  {
+    "id": "U02SAM",
+    "name": "sam",
+    "real_name": "Sam Patel",
+    "profile": {
+      "real_name": "Sam Patel",
+      "title": "Support Lead"
+    },
+    "is_restricted": false
+  },
+  {
+    "id": "U03LENA",
+    "name": "lena",
+    "real_name": "Lena Fischer",
+    "profile": {
+      "real_name": "Lena Fischer",
+      "title": "Support Specialist"
+    },
+    "is_restricted": false
+  },
+  {
+    "id": "U04MARCO",
+    "name": "marco",
+    "real_name": "Marco Bianchi",
+    "profile": {
+      "real_name": "Marco Bianchi",
+      "title": "Software Engineer"
+    },
+    "is_restricted": false
+  },
+  {
+    "id": "U05PRIYA",
+    "name": "priya",
+    "real_name": "Priya Nair",
+    "profile": {
+      "real_name": "Priya Nair",
+      "title": "People team"
+    },
+    "is_restricted": false
+  },
+  {
+    "id": "U06TOM",
+    "name": "tom",
+    "real_name": "Tom Okafor",
+    "profile": {
+      "real_name": "Tom Okafor",
+      "title": "IT helpdesk"
+    },
+    "is_restricted": false
+  },
+  {
+    "id": "U07GRACE",
+    "name": "grace",
+    "real_name": "Grace Liu",
+    "profile": {
+      "real_name": "Grace Liu",
+      "title": "Operations"
+    },
+    "is_restricted": false
+  },
+  {
+    "id": "U08NEWS",
+    "name": "partner-news",
+    "real_name": "Partner Newsletter",
+    "profile": {
+      "real_name": "Partner Newsletter",
+      "title": "Guest account (vendor)"
+    },
+    "is_restricted": true
+  }
+]

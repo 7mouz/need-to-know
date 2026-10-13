@@ -1,0 +1,14 @@
+[
+  {
+    "type": "message",
+    "user": "U02SAM",
+    "text": "Calendar export bug (KI-33): the workaround is still Settings → Time zone → pick your city. The fix is planned for the next release.",
+    "ts": "1789571100.000019"
+  },
+  {
+    "type": "message",
+    "user": "U03LENA",
+    "text": "Weekly numbers: 212 tickets, median first reply 38 minutes.",
+    "ts": "1789573200.000020"
+  }
+]
