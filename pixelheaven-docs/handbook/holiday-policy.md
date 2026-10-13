@@ -28,6 +28,6 @@ New Year's Day · Martin Luther King Jr. Day · Presidents' Day · Memorial Day 
 
 ## Contractors
 
-Contractors follow the time-off terms in their own contract. Tell your Northwind contact about planned absences at least 1 week ahead.
+Contractors follow the time-off terms in their own contract. Tell your PixelHeaven contact about planned absences at least 1 week ahead.
 
-Questions: people@northwind.example
+Questions: people@pixelheaven.example

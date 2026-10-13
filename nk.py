@@ -53,6 +53,7 @@ import difflib
 import email
 import email.errors
 import email.policy
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -66,6 +67,7 @@ import pathlib
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -327,7 +329,7 @@ def load_config():
 
 
 def load_email_domain():
-    """The company's email domain from roles.conf ('email-domain: northwind.example'): handoff replies go
+    """The company's email domain from roles.conf ('email-domain: pixelheaven.example'): handoff replies go
     only to addresses there, so nobody can have an answer sent outside the company."""
     for raw in ROLES_FILE.read_text(encoding="utf-8").splitlines():
         key, _, value = raw.split("#", 1)[0].strip().partition(":")
@@ -337,7 +339,7 @@ def load_email_domain():
 
 
 def load_company():
-    """The company name from roles.conf ('company: Northwind'). Change that one line for another company."""
+    """The company name from roles.conf ('company: PixelHeaven'). Change that one line for another company."""
     for raw in ROLES_FILE.read_text(encoding="utf-8").splitlines():
         key, _, value = raw.split("#", 1)[0].strip().partition(":")
         if key.strip().lower() == "company" and value.strip():
@@ -1948,6 +1950,7 @@ def web_status(role, roles):
                   "graph": pick(check, "Knowledge graph fully on"),
                   "stored": pick(audit_report, "Documents stored"),
                   "exposed": pick(audit_report, "Readable by a stranger")},
+        "in_hydra": len(hydra_state().get("docs", {})),        # documents nk uploaded to HydraDB (0 after hydra-reset)
         "chain": chain,
         "secure": setup_rec.get("secure") if setup_rec else None,
         "quarantined": sum(1 for x in QUARANTINE.rglob("*") if x.is_file()) if QUARANTINE.exists() else 0,
@@ -2081,18 +2084,32 @@ class _NkWeb(http.server.BaseHTTPRequestHandler):
 def web(port=WEB_PORT):
     """Serve the page on 127.0.0.1 only, until Ctrl+C."""
     load_config()
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), _NkWeb)
+    try:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", port), _NkWeb)
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            sys.exit(f"Port {port} is already in use: nk web is probably still running in another window.\n"
+                     "Stop it there with Ctrl+C (or close that window), then run nk web again.")
+        raise
     server.token, server.nonce, server.busy = secrets.token_urlsafe(18), secrets.token_urlsafe(12), threading.Lock()
+
+    def stop(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stop)   # kill, or a closed SSH window (SIGHUP): stop the same way as Ctrl+C
+    signal.signal(signal.SIGHUP, stop)
     audit("web-start", port=port)
-    print(f"Need-to-Know web page on port {port}, reachable from this machine only.\\n"
-          f"On your laptop, open a tunnel:  ssh -L {port}:127.0.0.1:{port} <your-ssh-host>\\n"
-          f"Then open:  http://localhost:{port}/?t={server.token}\\n"
+    print(f"Need-to-Know web page on port {port}, reachable from this machine only.\n"
+          f"On your laptop, open a tunnel:  ssh -L {port}:127.0.0.1:{port} <your-ssh-host>\n"
+          f"Then open:  http://localhost:{port}/?t={server.token}\n"
           "The link works until you stop this with Ctrl+C. A new link is made each time.", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\\nStopped.")
+        with contextlib.suppress(OSError):    # the window may already be gone
+            print("\nStopped.")
     finally:
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, signal.SIG_IGN)   # a second Ctrl+C can't cut the last log entry in half
         server.server_close()
         audit("web-stop", port=port)
 
@@ -2101,89 +2118,217 @@ WEB_PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Need-to-Know</title>
 <style nonce="{{NONCE}}">
-:root{--bg:#f4f6f9;--card:#ffffff;--line:#d8dee4;--text:#1f2328;--mute:#57606a;--green:#1a7f37;--amber:#9a6700;--red:#cf222e;--blue:#0969da}
+:root{--bg:#f6f7f9;--card:#ffffff;--line:#e4e4e7;--line2:#d4d4d8;--text:#18181b;--mute:#71717a;--soft:#f4f4f5;--green:#15803d;--green-bg:#dcfce7;--amber:#b45309;--amber-bg:#fef3c7;--red:#b91c1c;--red-bg:#fee2e2;--ink:#18181b;--ring:#2563eb}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:16px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;padding:16px 28px;border-bottom:1px solid var(--line);background:#ffffff}
-.brand{font-size:21px;font-weight:700}
-.brand small{display:block;font-size:13px;font-weight:400;color:var(--mute)}
-.who{color:var(--mute)}
-select,input,button{font:inherit;color:var(--text);background:#ffffff;border:1px solid #c4ccd4;border-radius:8px;padding:9px 12px}
-select{font-weight:600;color:var(--text)}
-button{background:var(--blue);border-color:var(--blue);color:#ffffff;font-weight:700;cursor:pointer}
-button:disabled{opacity:.55;cursor:default}
-main{display:grid;grid-template-columns:1.45fr 1fr;gap:22px;padding:22px 28px;max-width:1240px;margin:0 auto}
-@media (max-width:900px){main{grid-template-columns:1fr}}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin-bottom:22px;box-shadow:0 1px 3px rgba(31,35,40,.06)}
-h2{margin:0 0 12px;font-size:12px;letter-spacing:.09em;text-transform:uppercase;color:var(--mute)}
-.ask{display:flex;gap:10px}.ask input{flex:1}
+html,body{margin:0}
+body{background:var(--bg);color:var(--text);font:15px/1.55 "Inter","Segoe UI",system-ui,-apple-system,Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+.ic{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+header.top{position:sticky;top:0;z-index:5;background:rgba(255,255,255,.94);border-bottom:1px solid var(--line)}
+.top .in{max-width:1200px;margin:0 auto;padding:12px 24px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:12px}
+.mark{width:36px;height:36px;border-radius:10px;background:var(--ink);color:#fff;display:grid;place-items:center}
+.mark .ic{width:20px;height:20px}
+.brand b{display:block;font-size:16px;letter-spacing:-.01em}
+.brand small{display:block;color:var(--mute);font-size:12.5px}
+.right{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.pill{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line);background:#fff;border-radius:999px;padding:4px 11px;font-size:12.5px;color:var(--text);white-space:nowrap}
+.dot{width:7px;height:7px;border-radius:50%;background:#16a34a;flex:none}
+.dot.red{background:#dc2626}.dot.gray{background:#a1a1aa}
+.who{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:999px;padding:3px 8px 3px 4px;background:#fff}
+.av{width:26px;height:26px;border-radius:50%;background:var(--ink);color:#fff;display:grid;place-items:center;font-size:12px;font-weight:700;text-transform:uppercase}
+.who span.k{font-size:12.5px;color:var(--mute)}
+.demo{font-size:12.5px;color:var(--mute)}
+.who select{border:0;background:transparent;font:inherit;font-weight:600;color:var(--text);padding:2px 2px;cursor:pointer}
+.who select:focus{outline:2px solid var(--ring);border-radius:6px}
+.strip{max-width:1200px;margin:0 auto;padding:12px 24px 0;display:flex;flex-wrap:wrap;gap:8px}
+.strip .pill{color:var(--mute)}
+.strip .pill .ic{width:13px;height:13px;color:#16a34a}
+main{max-width:1200px;margin:0 auto;padding:16px 24px 40px}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;box-shadow:0 1px 2px rgba(24,24,27,.04)}
+.tile .head{display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--mute);font-size:13px}
+.tile .val{font-size:26px;font-weight:700;letter-spacing:-.02em;margin:6px 0 2px}
+.tile .cap{font-size:12.5px;color:var(--mute);line-height:1.45}
+.grid{display:grid;grid-template-columns:1.55fr 1fr;gap:18px;align-items:start}
+@media (max-width:980px){.kpis{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin-bottom:18px;box-shadow:0 1px 2px rgba(24,24,27,.04)}
+.card h3{margin:0;font-size:15px;letter-spacing:-.01em}
+.card .sub{margin:3px 0 14px;color:var(--mute);font-size:13px}
+.lbl{font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute);font-weight:600;margin:14px 0 4px}
+.search{position:relative;display:flex;gap:10px}
+.search > .ic{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--mute);width:17px;height:17px}
+input{font:inherit;color:var(--text);background:#fff;border:1px solid var(--line2);border-radius:9px;padding:10px 12px;width:100%}
+.search input{padding-left:38px}
+input:focus{outline:2px solid var(--ring);outline-offset:1px}
+button{font:inherit;font-weight:600;border-radius:9px;padding:10px 16px;cursor:pointer;border:1px solid var(--ink);background:var(--ink);color:#fff;white-space:nowrap;display:inline-flex;align-items:center;gap:7px}
+button:hover{background:#27272a}
+button:disabled{opacity:.5;cursor:default}
 .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
-.chip{background:#f6f8fa;border:1px solid var(--line);color:var(--text);font-weight:400;padding:5px 11px;border-radius:999px;font-size:14px}
-.chip:hover{border-color:var(--blue);color:var(--blue)}
-.badge{display:inline-block;font-size:13px;font-weight:700;padding:3px 10px;border-radius:999px;margin-bottom:10px;background:#eaeef2;color:var(--mute)}
-.b-answered{background:#dafbe1;color:var(--green)}.b-refused{background:#fff8c5;color:var(--amber)}
-.b-off-topic,.b-error{background:#ffebe9;color:var(--red)}
-.answer{white-space:pre-wrap}
-.src{margin-top:12px;font-size:13px;color:var(--mute)}
-.src span{display:inline-block;background:#f6f8fa;border:1px solid var(--line);border-radius:6px;padding:2px 8px;margin:4px 6px 0 0;color:var(--text)}
-.offer{border-color:#d4a72c;background:#fffdf3}
-.row{display:flex;gap:10px;margin-top:12px}.row input{flex:1}
-.note{font-size:14px;margin-top:10px;color:var(--amber)}
-.ok{color:var(--green)}.bad{color:var(--red)}.mute{color:var(--mute)}
-ul.list{list-style:none;margin:0;padding:0}
-ul.list li{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid var(--line);font-size:15px}
-ul.list li:last-child{border-bottom:0}
-.k{color:var(--text)}.v{font-weight:600;text-align:right;white-space:nowrap}
-.priv{font-size:14px;color:var(--mute);margin-top:12px;border-top:1px solid var(--line);padding-top:12px}
-ul.list.steps li{display:block;color:var(--mute);padding:7px 0 7px 24px;position:relative}
-ul.list.steps li::before{content:"✓";position:absolute;left:2px;top:7px;color:var(--green);font-weight:700}
+.chip{background:#fff;color:var(--text);border:1px solid var(--line);font-weight:500;font-size:13px;padding:5px 11px;border-radius:999px}
+.chip:hover{background:var(--soft)}
+.ans{border-left:4px solid var(--line2)}
+.ans.answered{border-left-color:#16a34a}.ans.refused{border-left-color:#d97706}.ans.off-topic,.ans.error{border-left-color:#dc2626}
+.status{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;font-weight:600;border-radius:999px;padding:4px 11px;background:var(--soft);color:var(--mute)}
+.status .ic{width:14px;height:14px}
+.status.answered{background:var(--green-bg);color:var(--green)}.status.refused{background:var(--amber-bg);color:var(--amber)}
+.status.off-topic,.status.error{background:var(--red-bg);color:var(--red)}
+.answer{white-space:pre-wrap;margin:12px 0 4px;font-size:15.5px}
+.docs{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.doc{display:inline-flex;align-items:center;gap:6px;font:12.5px/1.4 ui-monospace,"Cascadia Code",Consolas,monospace;background:var(--soft);border:1px solid var(--line);border-radius:6px;padding:3px 8px}
+.doc .ic{width:13px;height:13px;color:var(--mute)}
+.foot{display:flex;align-items:center;gap:7px;margin-top:14px;padding-top:12px;border-top:1px solid var(--line);font-size:12.5px;color:var(--mute)}
+.foot .ic{width:14px;height:14px}
+.note{display:flex;align-items:center;gap:7px;margin-top:10px;font-size:13px;color:var(--amber)}
+.handoff{border-color:#fcd34d;background:#fffdf5}
+.ttl{display:flex;align-items:center;gap:10px}
+.team{width:32px;height:32px;border-radius:8px;background:var(--amber-bg);color:var(--amber);display:grid;place-items:center;font-size:11.5px;font-weight:700}
+.handoff .sub{margin-top:10px}
+.row{display:flex;gap:10px;margin-top:4px}
+.fine{display:flex;align-items:center;gap:7px;margin-top:10px;font-size:12.5px;color:var(--mute)}
+.fine .ic{width:13px;height:13px}
+.result{margin-top:10px;font-size:13.5px;display:flex;align-items:center;gap:7px}
+.result.ok{color:var(--green)}.result.bad{color:var(--amber)}
+.steps{list-style:none;margin:0;padding:0}
+.steps li{display:grid;grid-template-columns:28px 1fr;gap:12px;padding:9px 0;position:relative}
+.steps li:not(:last-child)::after{content:"";position:absolute;left:13px;top:39px;bottom:-7px;width:2px;background:var(--line)}
+.num{width:28px;height:28px;border-radius:50%;border:1px solid var(--line2);background:#fff;display:grid;place-items:center;font-size:12.5px;font-weight:700}
+.steps b{display:block;font-size:14px}
+.steps span.d{color:var(--mute);font-size:13px}
+.meter{height:8px;background:var(--soft);border:1px solid var(--line);border-radius:999px;overflow:hidden;margin:8px 0 2px}
+.meter i{display:block;height:100%;width:0;background:#16a34a;border-radius:999px}
+.big{font-size:22px;font-weight:700;letter-spacing:-.02em}
+.big small{font-size:13px;font-weight:500;color:var(--mute);margin-left:6px;letter-spacing:0}
+.list{list-style:none;margin:0;padding:0}
+.list li{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 0;font-size:14px;border-bottom:1px solid var(--soft)}
+.list li:last-child{border-bottom:0}
+.list .l{display:flex;align-items:center;gap:8px}
+.list .r{color:var(--mute);font-size:13px;text-align:right}
+.ok-ic{color:#16a34a}.lock-ic{color:#a1a1aa}
+.list .r.good{color:var(--green);font-weight:600}.list .r.bad{color:var(--red);font-weight:600}
+.privacy .ic{color:#16a34a}
 .hidden{display:none}
 </style></head><body>
-<header>
-  <div class="brand">&#128274; Need-to-Know <small id="company">Company brain</small></div>
-  <div class="who">Signed in as <select id="role" aria-label="Role"></select></div>
-</header>
+<header class="top"><div class="in">
+ <div class="brand">
+  <div class="mark"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-3 8.5-7 10-4-1.5-7-5.5-7-10V6l7-3z"/><path d="M9 12l2 2 4-4"/></svg></div>
+  <div><b>Need-to-Know</b><small id="company">Company brain</small></div>
+ </div>
+ <div class="right">
+  <span class="pill"><span class="dot"></span>Private session</span>
+  <span class="demo">In real use, the role comes from your work login.</span>
+  <label class="who"><span class="av" id="avatar">?</span><span class="k">Demo role</span><select id="role" aria-label="Demo role"></select></label>
+ </div>
+</div></header>
+<div class="strip" id="strip"></div>
 <main>
- <section>
-  <div class="card">
-   <h2>Ask your company brain</h2>
-   <div class="ask"><input id="q" maxlength="500" placeholder="Ask a work question..." aria-label="Question"><button id="go">Ask</button></div>
-   <div class="chips" id="chips"></div>
-  </div>
-  <div class="card hidden" id="answerCard">
-   <span class="badge" id="badge"></span>
-   <div class="answer" id="answer"></div>
-   <div class="src" id="src"></div>
-   <div class="note hidden" id="notice"></div>
-  </div>
-  <div class="card offer hidden" id="offerCard">
-   <h2>Pass it to the right team?</h2>
-   <div id="offerText"></div>
-   <div class="row"><input id="email" aria-label="Work email"><button id="send">Send</button></div>
-   <div class="note" id="offerResult"></div>
-  </div>
-  <div class="card">
-   <h2>How your answer is checked</h2>
-   <ul class="list steps">
-    <li>Your role decides which documents the assistant has. Other teams' folders were never loaded.</li>
-    <li>Every answer must name one of your role's documents. If it can't, you get "not available".</li>
-    <li>If another team owns the answer, you can pass your question on. A person there decides what to share.</li>
-    <li>Every question goes into a log that can't be quietly edited.</li>
-   </ul>
-  </div>
- </section>
- <section>
-  <div class="card"><h2 id="seeTitle">What this role can see</h2><ul class="list" id="see"></ul></div>
-  <div class="card"><h2>Security, live</h2><ul class="list" id="sec"></ul><div class="priv" id="priv"></div></div>
- </section>
+ <section class="kpis" id="kpis"></section>
+ <div class="grid">
+  <section>
+   <div class="card">
+    <h3>Ask your company brain</h3>
+    <p class="sub" id="askSub">Answers come only from your role's documents, with the source.</p>
+    <div class="search"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+     <input id="q" maxlength="500" placeholder="Ask a work question..." aria-label="Question"><button id="go">Ask</button></div>
+    <div class="chips" id="chips"></div>
+   </div>
+   <div class="card ans hidden" id="answerCard">
+    <span class="status" id="badge"></span>
+    <div class="answer" id="answer"></div>
+    <div class="docs" id="src"></div>
+    <div class="note hidden" id="notice"></div>
+    <div class="foot" id="foot"></div>
+   </div>
+   <div class="card handoff hidden" id="offerCard">
+    <div class="ttl"><div class="team" id="teamAv">T</div><h3 id="offerTitle">Request it from the owner</h3></div>
+    <p class="sub" id="offerText"></p>
+    <div class="row"><input id="email" aria-label="Work email"><button id="send">Send request</button></div>
+    <div class="fine" id="offerFine"></div>
+    <div class="result hidden" id="offerResult"></div>
+   </div>
+   <div class="card">
+    <h3>How every answer is checked</h3>
+    <p class="sub">The same four steps run for every question, in this page and in the terminal.</p>
+    <ol class="steps">
+     <li><span class="num">1</span><div><b>Your role picks the folders</b><span class="d">Other teams' folders were never loaded into this assistant.</span></div></li>
+     <li><span class="num">2</span><div><b>The assistant searches only those</b><span class="d">Its tools are locked to its own folder, and its terminal is off.</span></div></li>
+     <li><span class="num">3</span><div><b>The answer must cite a document</b><span class="d">If it can't, you get "not available" and can ask the owner.</span></div></li>
+     <li><span class="num">4</span><div><b>Everything is logged</b><span class="d">In a log that shows if anyone edits or deletes an entry.</span></div></li>
+    </ol>
+   </div>
+  </section>
+  <aside>
+   <div class="card">
+    <h3 id="seeTitle">Access</h3>
+    <p class="sub">Need-to-know: each role gets only the folders its job needs.</p>
+    <div class="big" id="seeBig"></div>
+    <div class="meter"><i id="seeBar"></i></div>
+    <div class="lbl">Can see</div><ul class="list" id="see"></ul>
+    <div class="lbl">Locked</div><ul class="list" id="locked"></ul>
+   </div>
+   <div class="card">
+    <h3>Protections</h3>
+    <p class="sub">Live from this box.</p>
+    <ul class="list" id="sec"></ul>
+   </div>
+   <div class="card">
+    <h3>Private by design</h3>
+    <ul class="list privacy" id="priv"></ul>
+   </div>
+  </aside>
+ </div>
 </main>
 <script nonce="{{NONCE}}">
 const T = new URLSearchParams(location.search).get("t") || "";
 const $ = (id) => document.getElementById(id);
+const NS = document.querySelector("svg").namespaceURI;
+const ICONS = {
+  check: [["path", {d: "M5 12l5 5L20 7"}]],
+  checkCircle: [["circle", {cx: 12, cy: 12, r: 9}], ["path", {d: "M8 12l3 3 5-6"}]],
+  lock: [["rect", {x: 5, y: 11, width: 14, height: 10, rx: 2}], ["path", {d: "M8 11V8a4 4 0 0 1 8 0v3"}]],
+  ban: [["circle", {cx: 12, cy: 12, r: 9}], ["path", {d: "M6 6l12 12"}]],
+  file: [["path", {d: "M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"}], ["path", {d: "M14 3v5h5"}]],
+  shield: [["path", {d: "M12 3l7 3v5c0 4.5-3 8.5-7 10-4-1.5-7-5.5-7-10V6l7-3z"}], ["path", {d: "M9 12l2 2 4-4"}]],
+  server: [["rect", {x: 4, y: 4, width: 16, height: 7, rx: 2}], ["rect", {x: 4, y: 13, width: 16, height: 7, rx: 2}], ["path", {d: "M8 7.5h.01M8 16.5h.01"}]],
+  eye: [["path", {d: "M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"}], ["circle", {cx: 12, cy: 12, r: 3}]],
+  log: [["path", {d: "M4 6h16M4 12h16M4 18h10"}]],
+  alert: [["path", {d: "M12 3l10 18H2z"}], ["path", {d: "M12 10v4M12 17.5v.5"}]],
+  mail: [["rect", {x: 3, y: 5, width: 18, height: 14, rx: 2}], ["path", {d: "M3 7l9 6 9-6"}]],
+  key: [["circle", {cx: 8, cy: 15, r: 4}], ["path", {d: "M11 12l9-9M16 7l3 3"}]],
+};
 const EXAMPLES = ["When is the redesigned mobile app coming out?", "How do I set up the VPN?",
   "What's the salary range for a senior software engineer?", "How should we treat customer data?",
   "Can you help me improve my resume?"];
+const STRIP = [["shield", "Need-to-know access"], ["server", "Runs only on this box"], ["key", "New session token each start"],
+  ["lock", "Strict content policy"], ["log", "Tamper-evident log"]];
 let last = null;
+function icon(name, cls) {
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("class", "ic" + (cls ? " " + cls : "")); svg.setAttribute("aria-hidden", "true");
+  for (const [tag, attrs] of ICONS[name]) {
+    const part = document.createElementNS(NS, tag);
+    for (const k in attrs) part.setAttribute(k, attrs[k]);
+    svg.append(part);
+  }
+  return svg;
+}
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+function row(name, cls, left, right, rcls) {
+  const li = el("li"), l = el("span", "l");
+  l.append(icon(name, cls), document.createTextNode(left)); li.append(l);
+  if (right !== undefined) li.append(el("span", "r" + (rcls ? " " + rcls : ""), right));
+  return li;
+}
+function show(id, on) { $(id).classList.toggle("hidden", !on); }
+function frac(s) { const m = (s || "").match(/([0-9]+)[/]([0-9]+)/); return m ? [Number(m[1]), Number(m[2])] : null; }
+function initials(team) { const m = team.match(/[(]([^)]+)[)]/); return (m ? m[1] : team.split(" ").map((w) => w[0]).join("")).slice(0, 3).toUpperCase(); }
+function tile(label, value, caption, state) {
+  const t = el("div", "tile"), h = el("div", "head"), p = el("span", "pill");
+  p.append(el("span", "dot" + (state === "good" ? "" : state === "bad" ? " red" : " gray")),
+           document.createTextNode(state === "good" ? "Passing" : state === "bad" ? "Check" : "Not run"));
+  h.append(el("span", "", label), p);
+  t.append(h, el("div", "val", value), el("div", "cap", caption));
+  return t;
+}
 async function api(path, body) {
   const r = await fetch(path, {method: body ? "POST" : "GET",
     headers: {"X-NK-Token": T, "Content-Type": "application/json"}, body: body ? JSON.stringify(body) : undefined});
@@ -2192,73 +2337,91 @@ async function api(path, body) {
   if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
   return j;
 }
-function item(k, v, cls) {
-  const li = document.createElement("li");
-  const a = document.createElement("span"); a.className = "k"; a.textContent = k;
-  const b = document.createElement("span"); b.className = "v " + (cls || ""); b.textContent = v;
-  li.append(a, b); return li;
-}
-function show(id, on) { $(id).classList.toggle("hidden", !on); }
 async function loadRoles() {
   const j = await api("/api/roles");
-  $("company").textContent = j.company + " · each role sees only what its job needs";
-  for (const r of j.roles) { const o = document.createElement("option"); o.value = r; o.textContent = r; $("role").append(o); }
+  $("company").textContent = j.company + " company brain";
+  for (const r of j.roles) { const o = el("option", "", r); o.value = r; $("role").append(o); }
   if (j.roles.includes("support")) $("role").value = "support";
   $("email").placeholder = j.domain ? "you@" + j.domain : "your work email";
+  for (const [name, text] of STRIP) { const p = el("span", "pill"); p.append(icon(name), document.createTextNode(text)); $("strip").append(p); }
   for (const q of EXAMPLES) {
-    const c = document.createElement("button"); c.type = "button"; c.className = "chip"; c.textContent = q;
+    const c = el("button", "chip", q); c.type = "button";
     c.addEventListener("click", () => { $("q").value = q; $("q").focus(); });
     $("chips").append(c);
   }
   await loadStatus();
 }
 async function loadStatus() {
-  const role = $("role").value, s = await api("/api/status?role=" + encodeURIComponent(role));
-  $("seeTitle").textContent = "What " + role + " can see";
-  const see = $("see"); see.replaceChildren();
-  for (const f of s.allowed) see.append(item("✅ " + f.folder, f.docs + (f.docs === 1 ? " document" : " documents"), "ok"));
-  for (const h of s.hidden) see.append(item("🔒 " + h.folder, "ask the " + h.team, "mute"));
-  const sec = $("sec"), h = s.hydra || {}; sec.replaceChildren();
-  if (s.secure !== null && s.secure !== undefined) sec.append(item("Safety settings, every role", s.secure ? "all on" : "check nk setup", s.secure ? "ok" : "bad"));
-  if (h.clean) sec.append(item("HydraDB searches with nothing from other roles", h.clean, "ok"));
-  if (h.graph) sec.append(item("Knowledge-graph leak test", h.graph + " leaks", h.graph.startsWith("0/") ? "ok" : "bad"));
-  if (h.stored) sec.append(item("HydraDB audit, as every role and a stranger", h.stored + " docs, " + (h.exposed || "?") + " exposed", (h.exposed || "").startsWith("0") ? "ok" : "bad"));
-  if (s.chain) sec.append(item("Audit log (tamper-evident)", s.chain.ok ? "intact, " + s.chain.entries + " entries" : "problem: run nk log --verify", s.chain.ok ? "ok" : "bad"));
-  sec.append(item("Files quarantined (hidden instructions)", String(s.quarantined)));
-  sec.append(item("Probing alerts", String(s.alerts)));
-  sec.append(item("Questions waiting for a person", String(s.handoffs)));
-  $("priv").textContent = "Private by design: the documents stay on this box, and the AI (" + s.model + ") only sees the excerpts it needs to answer. This page answers on this machine only, through your SSH tunnel, and every action goes into the tamper-evident log.";
+  const role = $("role").value, s = await api("/api/status?role=" + encodeURIComponent(role)), h = s.hydra || {};
+  $("avatar").textContent = role.slice(0, 1);
+  $("askSub").textContent = "Answers come only from " + role + "'s documents, with the source.";
+  const clean = frac(h.clean), graph = frac(h.graph), k = $("kpis");
+  k.replaceChildren(
+    clean ? tile("Search isolation", h.clean, "HydraDB searches returned nothing from another role's folders", clean[0] === clean[1] ? "good" : "bad")
+          : tile("Search isolation", "Not run", "Run nk hydra-check", "none"),
+    graph ? tile("Knowledge graph", graph[0] + (graph[0] === 1 ? " leak" : " leaks"), graph[1] + " hidden answers tested with the graph fully on", graph[0] === 0 ? "good" : "bad")
+          : tile("Knowledge graph", "Not run", "Run nk hydra-check", "none"),
+    h.stored ? tile("Access audit", (h.exposed || "?") + " exposed", h.stored + " documents tried as every role and as a stranger", (h.exposed || "").startsWith("0") ? "good" : "bad")
+             : tile("Access audit", "Not run", "Run nk hydra-audit", "none"),
+    s.chain ? tile("Audit log", s.chain.ok ? "Intact" : "Broken", s.chain.entries + " entries, each holding the fingerprint of the one before", s.chain.ok ? "good" : "bad")
+            : tile("Audit log", "Empty", "No entries yet", "none"));
+  const total = s.allowed.length + s.hidden.length;
+  $("seeTitle").textContent = "Access for " + role;
+  $("seeBig").replaceChildren(document.createTextNode(s.allowed.length + " of " + total), el("small", "", "folders, " + s.docs + " documents"));
+  $("seeBar").style.width = Math.round(100 * s.allowed.length / Math.max(total, 1)) + "%";
+  $("see").replaceChildren(...s.allowed.map((f) => row("check", "ok-ic", f.folder, f.docs + (f.docs === 1 ? " doc" : " docs"))));
+  $("locked").replaceChildren(...s.hidden.map((x) => row("lock", "lock-ic", x.folder, "ask the " + x.team)));
+  $("sec").replaceChildren(
+    row("shield", "ok-ic", "Safety settings on every role", s.secure === true ? "All on" : s.secure === false ? "Check nk setup" : "Unknown",
+        s.secure === true ? "good" : s.secure === false ? "bad" : ""),
+    row("alert", "lock-ic", "Files blocked for hidden instructions", String(s.quarantined)),
+    row("eye", "lock-ic", "Probing alerts", String(s.alerts)),
+    row("mail", "lock-ic", "Requests waiting for a person", String(s.handoffs)));
+  $("priv").replaceChildren(
+    row("server", "", s.in_hydra ? "Documents stay on this box and in HydraDB, with an access list on every file"
+                                 : "Documents stay on this box"),
+    row("eye", "", "The AI (" + s.model + ") sees only " + s.role + "'s documents"),
+    row("lock", "", "This page answers only on this machine, through your SSH tunnel"),
+    row("log", "", "Every action goes into the tamper-evident log"));
 }
 async function ask() {
   const role = $("role").value, q = $("q").value.trim();
   if (!q) return;
-  $("go").disabled = true; $("go").textContent = "Thinking...";
-  show("answerCard", true); show("offerCard", false); show("notice", false);
-  $("badge").className = "badge"; $("badge").textContent = "Asking the " + role + " assistant...";
-  $("answer").textContent = ""; $("src").replaceChildren();
+  $("go").disabled = true; $("go").textContent = "Checking...";
+  show("offerCard", false); show("notice", false);
+  $("answerCard").className = "card ans";
+  $("badge").className = "status"; $("badge").replaceChildren(document.createTextNode("Asking the " + role + " assistant..."));
+  $("answer").textContent = ""; $("src").replaceChildren(); $("foot").replaceChildren();
   try {
     const a = await api("/api/ask", {role: role, question: q});
     last = {role: role, question: q, team: a.team};
-    const label = {answered: "Answered from " + role + "'s documents", refused: "Not in " + role + "'s documents",
-                   "off-topic": "Off-topic: declined", error: "Error"};
-    $("badge").className = "badge b-" + a.outcome; $("badge").textContent = label[a.outcome] || a.outcome;
+    const n = a.sources.length;
+    const meta = {
+      answered: ["checkCircle", "Answered from " + role + "'s documents", "check", "Checked: it cites " + (n === 1 ? "a document" : n + " documents") + " from " + role + "'s folders. Logged."],
+      refused: ["lock", "Not in " + role + "'s documents", "lock", "Nothing outside " + role + "'s folders was used. Logged."],
+      "off-topic": ["ban", "Declined: not company work", "ban", "The assistant only helps with company work. Logged."],
+      error: ["alert", "No answer", "alert", "The AI didn't answer. Nothing was shared."]}[a.outcome] || ["alert", a.outcome, "alert", ""];
+    $("answerCard").className = "card ans " + a.outcome;
+    $("badge").className = "status " + a.outcome;
+    $("badge").replaceChildren(icon(meta[0]), document.createTextNode(meta[1]));
     $("answer").textContent = a.answer;
-    if (a.sources.length) {
-      $("src").append(document.createTextNode("Source: "));
-      for (const f of a.sources) { const sp = document.createElement("span"); sp.textContent = f; $("src").append(sp); }
-    }
-    if (a.notice) { $("notice").textContent = "Requests for information outside your role are logged and reviewed."; show("notice", true); }
+    for (const f of a.sources) { const d = el("span", "doc"); d.append(icon("file"), document.createTextNode(f)); $("src").append(d); }
+    $("foot").append(icon(meta[2]), document.createTextNode(meta[3]));
+    if (a.notice) { $("notice").replaceChildren(icon("eye"), document.createTextNode("Requests for information outside your role are logged and reviewed.")); show("notice", true); }
     if (a.team) {
+      $("teamAv").textContent = initials(a.team);
+      $("offerTitle").textContent = "Request it from the " + a.team;
       $("offerText").textContent = a.can_pass
-        ? "The " + a.team + " owns this topic. A person there reads your question and decides what, if anything, the " + role + " role may know. If they share, they reply to your work email. Nothing is looked up or shared automatically."
-        : "The " + a.team + " owns this topic, but this question can't be passed on as written.";
-      $("offerResult").textContent = ""; $("offerResult").className = "note";
-      $("email").disabled = !a.can_pass; $("send").disabled = !a.can_pass;
+        ? "A person on the " + a.team + " reads your question and decides what, if anything, the " + role + " role may know. If they share, they reply to your work email."
+        : "This question can't be passed on as written.";
+      $("offerFine").replaceChildren(icon("lock"), document.createTextNode("Company addresses only. A person decides. Nothing is looked up or shared automatically."));
+      show("offerResult", false); $("email").disabled = !a.can_pass; $("send").disabled = !a.can_pass;
       show("offerCard", true);
     }
     loadStatus();
   } catch (e) {
-    $("badge").className = "badge b-error"; $("badge").textContent = "Error"; $("answer").textContent = e.message;
+    $("answerCard").className = "card ans error"; $("badge").className = "status error";
+    $("badge").replaceChildren(icon("alert"), document.createTextNode("Error")); $("answer").textContent = e.message;
   } finally { $("go").disabled = false; $("go").textContent = "Ask"; }
 }
 async function send() {
@@ -2266,10 +2429,14 @@ async function send() {
   $("send").disabled = true;
   try {
     const r = await api("/api/handoff", {role: last.role, question: last.question, team: last.team, email: $("email").value});
-    $("offerResult").className = "note " + (r.ok ? "ok" : ""); $("offerResult").textContent = r.message;
+    $("offerResult").className = "result " + (r.ok ? "ok" : "bad");
+    $("offerResult").replaceChildren(icon(r.ok ? "checkCircle" : "alert"), document.createTextNode(r.message));
     if (r.ok) $("email").disabled = true; else $("send").disabled = false;
     loadStatus();
-  } catch (e) { $("offerResult").textContent = e.message; $("send").disabled = false; }
+  } catch (e) {
+    $("offerResult").className = "result bad";
+    $("offerResult").replaceChildren(icon("alert"), document.createTextNode(e.message)); $("send").disabled = false;
+  }
 }
 $("go").addEventListener("click", ask);
 $("q").addEventListener("keydown", (e) => { if (e.key === "Enter") ask(); });

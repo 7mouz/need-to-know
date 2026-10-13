@@ -27,4 +27,4 @@ updated: 2026-07-01
 
 - New offers usually land in the lower half of the range.
 - Moving up a level means moving to that level's range.
-- Questions: people@northwind.example
+- Questions: people@pixelheaven.example

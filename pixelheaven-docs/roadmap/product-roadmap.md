@@ -5,7 +5,7 @@ owner: Product team
 updated: 2026-09-30
 ---
 
-# NorthwindFlow Product Roadmap (internal)
+# PixelFlow Product Roadmap (internal)
 
 > Fictional demo data.
 

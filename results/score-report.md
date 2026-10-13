@@ -1,5 +1,7 @@
 # Answer-quality report
 
+> Note: these results were made when the demo company was still called Northwind. It is now PixelHeaven (products PixelFlow and PixelConnect); the documents are otherwise the same.
+
 _Each role was asked every question; an automated LLM judge checked each answer against the expected source in `score-questions.conf`._
 
 **Score: 41/44 correct**

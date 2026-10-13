@@ -5,11 +5,11 @@ owner: Support team
 updated: 2026-09-22
 ---
 
-# NorthwindFlow: Frequently Asked Questions
+# PixelFlow: Frequently Asked Questions
 
 > Fictional demo data.
 
-**What is NorthwindFlow?**
+**What is PixelFlow?**
 A project-management app: projects, task boards, due dates, comments, and notifications for your team.
 
 **How much does it cost?**
@@ -21,7 +21,7 @@ A project-management app: projects, task boards, due dates, comments, and notifi
 Web browser, Windows, Mac, iPhone and iPad, and Android.
 
 **Can I use it offline, without internet?**
-Not today. NorthwindFlow needs an internet connection to load and save your work.
+Not today. PixelFlow needs an internet connection to load and save your work.
 
 **How do I sign in?**
 With your email and password. On the Team plan, you can also use your company's single sign-on: the "Sign in with company SSO" button.
@@ -30,5 +30,5 @@ With your email and password. On the Team plan, you can also use your company's 
 Yes. We back up all customer data every day and keep backups for 30 days.
 
 **How do I get help?**
-Email support@northwind.example. Support hours: Monday to Friday, 8 AM to 6 PM Pacific.
+Email support@pixelheaven.example. Support hours: Monday to Friday, 8 AM to 6 PM Pacific.
 Team-plan customers get a first reply within 4 business hours; Starter customers within 1 business day.

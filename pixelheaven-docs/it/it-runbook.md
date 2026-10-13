@@ -9,19 +9,19 @@ updated: 2026-09-30
 
 > Fictional demo data.
 
-For employees and contractors. Can't find your answer? Contact the IT helpdesk: it-help@northwind.example or extension 4357.
+For employees and contractors. Can't find your answer? Contact the IT helpdesk: it-help@pixelheaven.example or extension 4357.
 
 ## Set up the VPN (to reach internal tools from home)
 
-1. Open **HelpHub** (the IT self-service portal) → Software → install **NorthwindConnect**.
-2. Open NorthwindConnect and sign in with your company account.
+1. Open **HelpHub** (the IT self-service portal) → Software → install **PixelConnect**.
+2. Open PixelConnect and sign in with your company account.
 3. Approve the sign-in request in your authenticator app.
-4. Choose the **Northwind-HQ** connection and click Connect.
+4. Choose the **PixelHeaven-HQ** connection and click Connect.
 5. The icon turns green when you're connected.
 
-**Update by October 15, 2026:** NorthwindConnect version 5.1 or newer is required after that date. HelpHub → Software → NorthwindConnect → Update.
+**Update by October 15, 2026:** PixelConnect version 5.1 or newer is required after that date. HelpHub → Software → PixelConnect → Update.
 
-Trouble connecting? Restart NorthwindConnect, check your internet connection, then contact the helpdesk.
+Trouble connecting? Restart PixelConnect, check your internet connection, then contact the helpdesk.
 
 ## Your laptop
 
@@ -35,7 +35,7 @@ Trouble connecting? Restart NorthwindConnect, check your internet connection, th
 2. Your manager approves it.
 3. Most requests are done within 1 business day.
 
-Common tools: NorthwindFlow (our own app), Mail and Calendar, PeoplePort (HR portal), HelpHub (IT portal), Support Desk (Support team only).
+Common tools: PixelFlow (our own app), Mail and Calendar, PeoplePort (HR portal), HelpHub (IT portal), Support Desk (Support team only).
 
 ## Forgot your password?
 

@@ -1,8 +1,8 @@
-# Northwind Inc.: Demo Company Knowledge
+# PixelHeaven Inc.: Demo Company Knowledge
 
-**All fictional.** Northwind Inc. is an invented company for the Need-to-Know demo (Company Brain Hackathon). Names, numbers, and customers are made up.
+**All fictional.** PixelHeaven Inc. is an invented company for the Need-to-Know demo (Company Brain Hackathon). Names, numbers, and customers are made up.
 
-Northwind makes **NorthwindFlow**, a project-management app.
+PixelHeaven makes **PixelFlow**, a project-management app.
 
 ## Who needs what (the access map)
 

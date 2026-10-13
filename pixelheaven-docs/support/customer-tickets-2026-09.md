@@ -16,7 +16,7 @@ updated: 2026-10-01
 - **What we did:** sent the KI-31 steps. Steps 1–3 didn't help; their admin added the new SSO sign-in address (step 4), and it worked.
 - **Status:** solved September 24.
 
-## #4520: "Can we use NorthwindFlow without internet?"
+## #4520: "Can we use PixelFlow without internet?"
 
 - **Customer:** Maple Street Bakery (Starter plan) · **Opened:** September 26
 - **Request:** their delivery drivers want to check tasks in areas with no signal.

@@ -9,7 +9,7 @@ updated: 2026-08-15
 
 > Fictional demo data.
 
-For everyone who works at Northwind: employees and contractors.
+For everyone who works at PixelHeaven: employees and contractors.
 
 ## Hours
 
@@ -24,12 +24,12 @@ For everyone who works at Northwind: employees and contractors.
 ## Desks and rooms
 
 - Desks are shared, first come, first served. Clear your desk at the end of the day.
-- Book meeting rooms on the "Rooms" board in NorthwindFlow.
+- Book meeting rooms on the "Rooms" board in PixelFlow.
 
 ## Wi-Fi
 
-- Staff: "Northwind-Staff". Sign in with your company account.
-- Guests: "Northwind-Guest". The front desk gives guests the current access card; it changes every Monday.
+- Staff: "PixelHeaven-Staff". Sign in with your company account.
+- Guests: "PixelHeaven-Guest". The front desk gives guests the current access card; it changes every Monday.
 
 ## Working from home
 
@@ -43,6 +43,6 @@ For everyone who works at Northwind: employees and contractors.
 
 ## Who to ask
 
-- Building, badges, rooms: front desk (frontdesk@northwind.example)
+- Building, badges, rooms: front desk (frontdesk@pixelheaven.example)
 - Laptops, VPN, accounts: IT helpdesk (see the IT runbook)
-- Time off and pay questions: People team (people@northwind.example)
+- Time off and pay questions: People team (people@pixelheaven.example)

@@ -2,7 +2,7 @@
 
 A company brain that knows who's asking. It runs on [OpenClaw](https://openclaw.ai) and can store its documents in [HydraDB](https://hydradb.com).
 
-> All company data here is made up (Northwind Inc., a fictional software company).
+> All company data here is made up (PixelHeaven Inc., a fictional software company).
 
 ![The web page: a contractor asks for the senior engineer salary range. The answer is "not in contractor's documents", the page offers to pass the question to the People team (HR), and the right side shows what a contractor can see and the live security results.](screenshots/web-answer.png)
 
@@ -150,11 +150,11 @@ You need OpenClaw 2026.9.x running as its own user, Python 3, and an AI. For the
 
 ```bash
 mkdir -p ~/needtoknow && cp nk.py roles.conf score-questions.conf ~/needtoknow/
-cp -r northwind-docs ~/needtoknow/
+cp -r pixelheaven-docs ~/needtoknow/
 # save your AI key privately (it's never printed):
 (umask 077; mkdir -p ~/needtoknow/.secrets; read -rsp "Key: " K; echo; printf "%s" "$K" > ~/needtoknow/.secrets/model.key)
 cd ~ && python3 ~/needtoknow/nk.py setup --prune
-python3 ~/needtoknow/nk.py ingest-dir ~/needtoknow/northwind-docs && python3 ~/needtoknow/nk.py index
+python3 ~/needtoknow/nk.py ingest-dir ~/needtoknow/pixelheaven-docs && python3 ~/needtoknow/nk.py index
 python3 ~/needtoknow/nk.py check && python3 ~/needtoknow/nk.py score
 ```
 

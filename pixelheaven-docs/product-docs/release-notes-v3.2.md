@@ -5,7 +5,7 @@ owner: Product team
 updated: 2026-09-22
 ---
 
-# Release Notes: NorthwindFlow 3.2
+# Release Notes: PixelFlow 3.2
 
 > Fictional demo data.
 
@@ -19,7 +19,7 @@ updated: 2026-09-22
 ## Changed
 
 - **Everyone is signed out once** after updating. Saved sign-ins from older versions no longer work.
-- **New SSO sign-in address.** Companies that use single sign-on must add https://login.northwind.example/sso/callback in their SSO provider. The old address stops working on October 31, 2026.
+- **New SSO sign-in address.** Companies that use single sign-on must add https://login.pixelheaven.example/sso/callback in their SSO provider. The old address stops working on October 31, 2026.
 
 ## Fixed
 

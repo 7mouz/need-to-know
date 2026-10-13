@@ -5,7 +5,7 @@ owner: Leadership team
 updated: 2026-09-15
 ---
 
-# Northwind Values
+# PixelHeaven Values
 
 > Fictional demo data.
 
@@ -33,4 +33,4 @@ Four values guide how we work with each other, with our customers, and with our 
 
 **What we believe:** Small, frequent improvements beat big, rare launches. We try new tools, measure the results, and keep what works.
 
-**Why it makes us a good partner:** We improve NorthwindFlow every few months, and we adopt new technology carefully: we test it before it touches customer data.
+**Why it makes us a good partner:** We improve PixelFlow every few months, and we adopt new technology carefully: we test it before it touches customer data.

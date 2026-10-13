@@ -1,5 +1,7 @@
 # First-week brief: hr
 
+> Note: these results were made when the demo company was still called Northwind. It is now PixelHeaven (products PixelFlow and PixelConnect); the documents are otherwise the same.
+
 ## Who we are
 Northwind Inc. makes NorthwindFlow, a project-management app for teams. Founded in 2019, we have about 120 employees and over 1,000 customer teams.
 

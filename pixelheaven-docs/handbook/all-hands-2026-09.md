@@ -9,11 +9,11 @@ updated: 2026-09-25
 
 > Fictional demo data.
 
-Everyone at Northwind, employees and contractors, can read these notes.
+Everyone at PixelHeaven, employees and contractors, can read these notes.
 
 ## Wins
 
-- **NorthwindFlow 3.2 shipped on September 22**, with a new sign-in page and faster task boards.
+- **PixelFlow 3.2 shipped on September 22**, with a new sign-in page and faster task boards.
 - We passed **1,000 customer teams** this month.
 
 ## Heads-up
